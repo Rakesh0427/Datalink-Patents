@@ -66,12 +66,19 @@ class GitScrDiscoveryTests(unittest.TestCase):
             (source / "unit.c").write_text("int value(void) { return 42; }\n", encoding="utf-8")
             subprocess.run(["git", "commit", "-am", "Correct scaling for SCR-42"], cwd=source, check=True, capture_output=True)
 
-            session = DesktopApp._inspect_repo(str(source))
+            progress_events = []
+            session = DesktopApp._inspect_repo(
+                str(source), progress=lambda percent, message: progress_events.append((percent, message))
+            )
             try:
                 self.assertTrue(any(issue["key"] == "SCR-42" for issue in session["discovered_issues"]))
                 self.assertIn("feature/SCR-42-scaling", session["refs"])
                 self.assertIn("Correct scaling for SCR-42", session["recent_commits"][0]["subject"])
                 self.assertTrue(session["default_base"])
+                self.assertTrue(any("Scanning commit messages for SCR keys: 2/2" in message for _percent, message in progress_events))
+                percentages = [percent for percent, _message in progress_events if percent is not None]
+                self.assertEqual(percentages, sorted(percentages))
+                self.assertEqual(percentages[-1], 99)
             finally:
                 session["tempdir"].cleanup()
 

@@ -65,7 +65,11 @@ class CxxAnalyzerTests(unittest.TestCase):
             head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
             output = Path(temp) / "report"
             issue = {"key": "SCR-12", "summary": "Change calibration", "updated": "today", "status": "Open"}
-            files = analyze_change(root, base, head, issue, output, root / "ccdc.json")
+            progress_events = []
+            files = analyze_change(
+                root, base, head, issue, output, root / "ccdc.json",
+                progress=lambda percent, message: progress_events.append((percent, message)),
+            )
             report = json.loads(files["json"].read_text())
             self.assertIn("src/sensor/sensor.c::convert_temperature#1", report["changed_functions"])
             self.assertIn("TC-TEMP", report["recommended_tests"])
@@ -82,6 +86,11 @@ class CxxAnalyzerTests(unittest.TestCase):
             self.assertIn("CC edges — Control Coupling", markdown)
             self.assertIn("DC edges — Data Coupling", markdown)
             self.assertIn("Mermaid.js", markdown)
+            determinate = [percent for percent, _message in progress_events if percent is not None]
+            self.assertEqual(determinate[-1], 99)
+            self.assertEqual(determinate, sorted(determinate))
+            self.assertTrue(any("parsed" in message and "/" in message for _percent, message in progress_events))
+            self.assertTrue(any("baseline source blobs" in message for _percent, message in progress_events))
 
 
 if __name__ == "__main__":

@@ -18,7 +18,7 @@ except ModuleNotFoundError:  # Tkinter ships with python.org Python on Windows/m
     tk = None  # type: ignore[assignment]
     filedialog = messagebox = ttk = None  # type: ignore[assignment]
 
-from .analyzer import analyze_change
+from .analyzer import ProgressCallback, analyze_change
 from .cli import _clone_repo, _default_base, _git
 from .jira import JiraClient
 
@@ -26,7 +26,11 @@ ISSUE_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]+-\d+$")
 ISSUE_KEY_SCAN_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b", re.IGNORECASE)
 
 
-def discover_git_issues(refs: list[str], commits: list[dict[str, str]]) -> tuple[list[dict[str, Any]], dict[str, dict[str, list[Any]]]]:
+def discover_git_issues(
+    refs: list[str],
+    commits: list[dict[str, str]],
+    progress: Callable[[int, int], None] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, list[Any]]]]:
     """Collect SCR-like keys from refs and recent commit subjects without Jira."""
     matches: dict[str, dict[str, list[Any]]] = {}
 
@@ -39,11 +43,15 @@ def discover_git_issues(refs: list[str], commits: list[dict[str, str]]) -> tuple
             branches = ensure(key)["branches"]
             if ref not in branches:
                 branches.append(ref)
-    for commit in commits:
+    total_commits = len(commits)
+    update_every = max(1, total_commits // 40)
+    for index, commit in enumerate(commits, start=1):
         for key in ISSUE_KEY_SCAN_RE.findall(commit.get("subject", "")):
             bucket = ensure(key)["commits"]
             if commit not in bucket:
                 bucket.append(commit)
+        if progress and (index == total_commits or index % update_every == 0):
+            progress(index, total_commits)
 
     issues = []
     for key, found in matches.items():
@@ -129,6 +137,8 @@ class DesktopApp:
         self.repo_session: dict[str, Any] | None = None
         self.report_paths: dict[str, Path] = {}
         self._busy = False
+        self._progress_animation_running = False
+        self._progress_reset_id: str | None = None
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._close)
         self._toggle_mode()
@@ -226,6 +236,17 @@ class DesktopApp:
         self.load_button.pack(side="left")
         self.status_label = ttk.Label(actions, textvariable=self.status)
         self.status_label.pack(side="left", padx=(12, 0))
+        self.progress_frame = ttk.Frame(source)
+        self.progress_frame.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self.progress_detail = tk.StringVar(value="")
+        self.progress_percent = tk.StringVar(value="")
+        ttk.Label(self.progress_frame, textvariable=self.progress_detail, anchor="w").grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        self.progress_bar = ttk.Progressbar(self.progress_frame, mode="indeterminate", maximum=100, length=280)
+        self.progress_bar.grid(row=0, column=1, sticky="ew")
+        ttk.Label(self.progress_frame, textvariable=self.progress_percent, width=8, anchor="e").grid(row=0, column=2, sticky="e", padx=(8, 0))
+        self.progress_frame.columnconfigure(0, weight=3)
+        self.progress_frame.columnconfigure(1, weight=2)
+        self.progress_frame.grid_remove()
 
         self.issue_frame = ttk.LabelFrame(outer, text="2 · SCRs and Git updates", style="Section.TLabelframe", padding=8)
         self.issue_frame.pack(fill="x", pady=(10, 0))
@@ -547,9 +568,10 @@ class DesktopApp:
         self.selected_issue = None
         self.analyze_button.configure(state="disabled")
         self._run_async(
-            lambda: self._inspect_repo(repo_value),
+            lambda: self._inspect_repo(repo_value, self._report_progress),
             self._show_git_repository,
             "Cloning/fetching repository and scanning branches + recent commits…",
+            completion_text="Repository scan complete · refs, commits, and SCR keys are loaded.",
         )
 
     def _start_repo_inspection(self, repo_value: str, issue: dict[str, Any]) -> None:
@@ -563,35 +585,66 @@ class DesktopApp:
             return
         self.analyze_button.configure(state="disabled")
         self._run_async(
-            lambda: self._inspect_repo(repo_value),
+            lambda: self._inspect_repo(repo_value, self._report_progress),
             lambda session: self._show_jira_repository(session, issue),
             f"Loading repository details for {issue['key']}…",
+            completion_text=f"Repository details ready for {issue['key']}.",
         )
 
     @staticmethod
-    def _inspect_repo(repo_value: str) -> dict[str, Any]:
+    def _inspect_repo(repo_value: str, progress: ProgressCallback | None = None) -> dict[str, Any]:
+        def report(value: float | None, message: str) -> None:
+            if progress:
+                progress(value, message)
+
         tempdir = tempfile.TemporaryDirectory(prefix="ccdc-desktop-")
         repo = Path(tempdir.name) / "repo"
         try:
+            report(None, "Cloning/fetching the repository and receiving Git objects…")
             _clone_repo(repo_value, repo)
+            report(52, "Repository data received. Enumerating local and remote refs…")
             refs = sorted({
                 ref for ref in _git(["for-each-ref", "--format=%(refname:short)", "refs/remotes/origin", "refs/heads"], repo, check=False).splitlines()
                 if ref and not ref.endswith("/HEAD")
             })
+            report(57, f"Found {len(refs)} refs. Reading up to 5,000 recent commit subjects…")
+            report(None, "Git is collecting recent commit metadata…")
             raw_log = _git(
                 ["log", "--all", "--max-count=5000", "--date=short", "--format=%H%x09%ad%x09%s"],
                 repo,
                 check=False,
             )
+            log_lines = raw_log.splitlines()
+            total_lines = len(log_lines)
             commits = []
-            for line in raw_log.splitlines():
+            update_every = max(1, total_lines // 35)
+            for index, line in enumerate(log_lines, start=1):
                 parts = line.split("\t", 2)
                 if len(parts) == 3:
                     commits.append({"ref": parts[0], "short": parts[0][:10], "date": parts[1], "subject": parts[2]})
+                if total_lines and (index == total_lines or index % update_every == 0):
+                    percent = 59 + 15 * index / total_lines
+                    report(percent, f"Reading commit list: {index}/{total_lines} entries")
+
+            if total_lines:
+                report(74, f"Checking {len(commits)} commit subjects and {len(refs)} refs for SCR keys…")
+                issues, issue_matches = discover_git_issues(
+                    refs,
+                    commits,
+                    progress=lambda done, total: report(
+                        74 + 17 * done / max(1, total),
+                        f"Scanning commit messages for SCR keys: {done}/{total}",
+                    ),
+                )
+            else:
+                report(91, "No commits to scan; checking branch names for SCR keys…")
+                issues, issue_matches = discover_git_issues(refs, commits)
             if not refs and not commits:
                 raise RuntimeError("Git clone completed, but the repository has no branches or commits to inspect. Verify that this is a non-empty Git repository.")
-            issues, issue_matches = discover_git_issues(refs, commits)
             latest = commits[0] if commits else {"subject": "No commits found", "date": ""}
+            report(96, "Selecting the default base ref and preparing repository details…")
+            default_base = _default_base(repo)
+            report(99, f"Preparing the recent-update list ({min(100, len(commits))} displayed commits)…")
             return {
                 "tempdir": tempdir,
                 "path": repo,
@@ -601,7 +654,7 @@ class DesktopApp:
                 "recent_commits": commits[:100],
                 "discovered_issues": issues,
                 "issue_matches": issue_matches,
-                "default_base": _default_base(repo),
+                "default_base": default_base,
                 "latest_commit": latest,
             }
         except Exception:
@@ -697,19 +750,37 @@ class DesktopApp:
         output_dir = Path.cwd() / "ccdc-reports" / issue["key"]
 
         def run() -> dict[str, Any]:
+            self._report_progress(None, f"Verifying base ref {base_ref}…")
             if not _git(["rev-parse", "--verify", base_ref], session["path"], check=False):
                 raise RuntimeError(f"Git base ref was not found: {base_ref}")
+            self._report_progress(None, f"Base ref verified. Checking head ref {head_ref}…")
             if not _git(["rev-parse", "--verify", head_ref], session["path"], check=False):
                 raise RuntimeError(f"Git head ref was not found: {head_ref}")
+            self._report_progress(None, "Both refs exist. Checking their common ancestor…")
             if not _git(["merge-base", base_ref, head_ref], session["path"], check=False):
                 raise RuntimeError("Base and head refs have no common ancestor.")
-            paths = analyze_change(session["path"], base_ref, head_ref, issue, output_dir, config_path, repo_label=session["repo_label"])
+            self._report_progress(None, "Refs are ready. Beginning C/C++ impact analysis…")
+            paths = analyze_change(
+                session["path"], base_ref, head_ref, issue, output_dir, config_path,
+                repo_label=session["repo_label"], progress=self._report_progress,
+            )
+            self._report_progress(99, "Loading Markdown, JSON, source diff, and Mermaid source into the report tabs…")
             contents = {key: paths[key].read_text(encoding="utf-8") for key in ("markdown", "diff", "mermaid", "json")}
             report = json.loads(contents["json"])
-            return {"paths": paths, "contents": contents, "report": report}
+            self._report_progress(None, "Decoding the generated Mermaid PNG for the diagram tab…")
+            from PIL import Image
+
+            with Image.open(paths["mermaid_png"]) as source_image:
+                flow_image = source_image.convert("RGB")
+            return {"paths": paths, "contents": contents, "report": report, "flow_image": flow_image}
 
         self.analyze_button.configure(state="disabled")
-        self._run_async(run, self._show_report, f"Analyzing {issue['key']} · {base_ref} → {head_ref}…")
+        self._run_async(
+            run,
+            self._show_report,
+            f"Analyzing {issue['key']} · {base_ref} → {head_ref}…",
+            completion_text="Analysis complete · impact report and rendered Mermaid diagram are ready.",
+        )
 
     @staticmethod
     def _replace_text(widget: tk.Text, content: str) -> None:
@@ -794,7 +865,14 @@ class DesktopApp:
         if self.flow_report is not None and self.flow_png_path is not None:
             self._draw_flow(self.flow_report, zoom=self.flow_zoom * factor)
 
-    def _draw_flow(self, report: dict[str, Any], image_path: Path | None = None, fit: bool = False, zoom: float | None = None) -> None:
+    def _draw_flow(
+        self,
+        report: dict[str, Any],
+        image_path: Path | None = None,
+        image: Any = None,
+        fit: bool = False,
+        zoom: float | None = None,
+    ) -> None:
         from PIL import Image, ImageTk
 
         self.flow_report = report
@@ -809,7 +887,9 @@ class DesktopApp:
             self.flow_status.set(message)
             return
 
-        if self.flow_image_original is None or image_path is not None:
+        if image is not None:
+            self.flow_image_original = image
+        elif self.flow_image_original is None or image_path is not None:
             with Image.open(self.flow_png_path) as source:
                 self.flow_image_original = source.convert("RGB")
         original = self.flow_image_original
@@ -858,7 +938,7 @@ class DesktopApp:
         self._populate_edge_table(report)
         self.notebook.select(1)
         self.root.update_idletasks()
-        self._draw_flow(report, image_path=self.report_paths.get("mermaid_png"), fit=True)
+        self._draw_flow(report, image_path=self.report_paths.get("mermaid_png"), image=result.get("flow_image"), fit=True)
         self.open_report_button.configure(state="normal")
         self.analyze_button.configure(state="normal")
         self.status.set(f"Analysis complete · report saved to {self.report_paths['markdown']}")
@@ -883,11 +963,82 @@ class DesktopApp:
         except OSError as exc:
             messagebox.showerror("Could not open report", str(exc), parent=self.root)
 
-    def _run_async(self, work: Callable[[], Any], on_success: Callable[[Any], None], busy_text: str) -> None:
+    def _report_progress(self, percent: float | None, message: str) -> None:
+        """Queue worker progress on Tk's main thread; None means work is not countable yet."""
+        try:
+            self.root.after(0, self._set_progress, percent, message)
+        except tk.TclError:
+            pass
+
+    def _set_progress(self, percent: float | None, message: str) -> None:
+        if not self.progress_frame.winfo_manager():
+            self.progress_frame.grid()
+        self.progress_detail.set(message)
+        if percent is None:
+            if self.progress_bar.cget("mode") != "indeterminate":
+                self.progress_bar.stop()
+                self._progress_animation_running = False
+                self.progress_bar.configure(mode="indeterminate")
+            if not self._progress_animation_running:
+                self.progress_bar.start(12)
+                self._progress_animation_running = True
+            self.progress_percent.set("Working")
+            return
+
+        if self._progress_animation_running:
+            self.progress_bar.stop()
+            self._progress_animation_running = False
+        if self.progress_bar.cget("mode") != "determinate":
+            self.progress_bar.configure(mode="determinate")
+        bounded = max(0.0, min(100.0, percent))
+        self.progress_bar.configure(value=bounded)
+        self.progress_percent.set(f"{bounded:.0f}%")
+
+    def _begin_progress(self, message: str) -> None:
+        if self._progress_reset_id is not None:
+            try:
+                self.root.after_cancel(self._progress_reset_id)
+            except tk.TclError:
+                pass
+            self._progress_reset_id = None
+        self.progress_frame.grid()
+        self.progress_bar.stop()
+        self._progress_animation_running = False
+        self.progress_bar.configure(mode="indeterminate", value=0)
+        self.progress_detail.set(message)
+        self.progress_percent.set("Working")
+        self.progress_bar.start(12)
+        self._progress_animation_running = True
+
+    def _complete_progress(self, message: str) -> None:
+        if self._progress_animation_running:
+            self.progress_bar.stop()
+            self._progress_animation_running = False
+        self.progress_bar.configure(mode="determinate", value=100)
+        self.progress_percent.set("100%")
+        self.progress_detail.set(message)
+        self._progress_reset_id = self.root.after(4000, self._hide_progress)
+
+    def _hide_progress(self) -> None:
+        self._progress_reset_id = None
+        if not self._busy:
+            self.progress_frame.grid_remove()
+            self.progress_bar.configure(value=0)
+            self.progress_detail.set("")
+            self.progress_percent.set("")
+
+    def _run_async(
+        self,
+        work: Callable[[], Any],
+        on_success: Callable[[Any], None],
+        busy_text: str,
+        completion_text: str = "Operation complete.",
+    ) -> None:
         if self._busy:
             return
         self._busy = True
         self.status.set(busy_text)
+        self._begin_progress(busy_text)
         self.load_button.configure(state="disabled")
         self.inspect_button.configure(state="disabled")
         self.analyze_button.configure(state="disabled")
@@ -899,17 +1050,18 @@ class DesktopApp:
             except Exception as exc:
                 self.root.after(0, self._finish_error, str(exc))
             else:
-                self.root.after(0, self._finish_success, on_success, result)
+                self.root.after(0, self._finish_success, on_success, result, completion_text)
 
         self.executor.submit(run)
 
-    def _finish_success(self, callback: Callable[[Any], None], result: Any) -> None:
+    def _finish_success(self, callback: Callable[[Any], None], result: Any, completion_text: str) -> None:
         self._busy = False
         self.root.configure(cursor="")
         self.load_button.configure(state="normal")
         if self.mode.get() == "jira" and self.issues:
             self.inspect_button.configure(state="normal")
         callback(result)
+        self._complete_progress(completion_text)
 
     def _finish_error(self, message: str) -> None:
         self._busy = False
@@ -917,6 +1069,12 @@ class DesktopApp:
         self.load_button.configure(state="normal")
         self.inspect_button.configure(state="normal" if self.mode.get() == "jira" and self.issues else "disabled")
         self.analyze_button.configure(state="normal" if self.repo_session else "disabled")
+        if self._progress_animation_running:
+            self.progress_bar.stop()
+            self._progress_animation_running = False
+        self.progress_bar.configure(mode="determinate")
+        self.progress_detail.set("Operation failed · see error details")
+        self.progress_percent.set("Error")
         self.status.set("Operation failed · see error details")
         messagebox.showerror("CC/DC operation failed", message, parent=self.root)
 

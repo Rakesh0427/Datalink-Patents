@@ -8,7 +8,7 @@ import tempfile
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from tree_sitter import Language, Parser
 import tree_sitter_c
@@ -16,6 +16,12 @@ import tree_sitter_cpp
 
 EXTENSIONS = {".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx", ".C", ".H"}
 SKIP_DIRS = {".git", ".svn", "build", "dist", "out", "target", "vendor", "third_party", "node_modules", ".venv", "venv"}
+ProgressCallback = Callable[[float | None, str], None]
+
+
+def _notify_progress(progress: ProgressCallback | None, value: float | None, message: str) -> None:
+    if progress is not None:
+        progress(value, message)
 
 
 @dataclass
@@ -179,22 +185,45 @@ def _component_for(path: str, config: dict[str, Any]) -> str:
     return parts[0] if len(parts) > 1 else "root"
 
 
-def _find_functions(root: Path, config: dict[str, Any]) -> tuple[dict[str, Function], dict[str, bytes], list[str]]:
+def _find_functions(
+    root: Path,
+    config: dict[str, Any],
+    progress: ProgressCallback | None = None,
+    progress_start: float = 0.0,
+    progress_end: float = 100.0,
+    progress_label: str = "Parsing source",
+) -> tuple[dict[str, Function], dict[str, bytes], list[str]]:
     functions: dict[str, Function] = {}
     source_map: dict[str, bytes] = {}
     parse_warnings: list[str] = []
     files = []
+    _notify_progress(progress, None, f"{progress_label}: locating C/C++ files…")
     for directory, subdirs, filenames in os.walk(root):
         subdirs[:] = sorted(name for name in subdirs if name not in SKIP_DIRS)
         base = Path(directory)
         files.extend(base / name for name in filenames if Path(name).suffix in EXTENSIONS)
-    for path in sorted(files):
+    files = sorted(files)
+    total_files = len(files)
+    if total_files:
+        _notify_progress(progress, progress_start, f"{progress_label}: parsing 0/{total_files} source files…")
+    else:
+        _notify_progress(progress, progress_end, f"{progress_label}: no C/C++ source files found")
+    update_every = max(1, total_files // 40)
+
+    def report_file_progress(index: int) -> None:
+        if total_files and (index == total_files or index % update_every == 0):
+            fraction = index / total_files
+            value = progress_start + (progress_end - progress_start) * fraction
+            _notify_progress(progress, value, f"{progress_label}: parsed {index}/{total_files} source files")
+
+    for index, path in enumerate(files, start=1):
         relative = path.relative_to(root).as_posix()
         try:
             source = path.read_bytes()
             tree = _parser_for(path).parse(source)
         except (OSError, ValueError) as exc:
             parse_warnings.append(f"{relative}: parse/read error: {exc}")
+            report_file_progress(index)
             continue
         source_map[relative] = source
         if tree.root_node.has_error:
@@ -221,6 +250,7 @@ def _find_functions(root: Path, config: dict[str, Any]) -> tuple[dict[str, Funct
                 component=_component_for(relative, config),
                 arity=len(params),
             )
+        report_file_progress(index)
     return functions, source_map, parse_warnings
 
 
@@ -250,16 +280,33 @@ def _under_control_body(call_node) -> bool:
     return False
 
 
-def _build_edges(root: Path, functions: dict[str, Function], source_map: dict[str, bytes]) -> tuple[list[CallEdge], list[str]]:
+def _build_edges(
+    root: Path,
+    functions: dict[str, Function],
+    source_map: dict[str, bytes],
+    progress: ProgressCallback | None = None,
+    progress_start: float = 0.0,
+    progress_end: float = 100.0,
+    progress_label: str = "Resolving call and coupling edges",
+) -> tuple[list[CallEdge], list[str]]:
     by_simple: dict[str, list[Function]] = defaultdict(list)
     for fn in functions.values():
         by_simple[_simple_name(fn.name)].append(fn)
     edges: list[CallEdge] = []
     unresolved: list[str] = []
-    for path, source in source_map.items():
+    total_files = len(source_map)
+    if not total_files:
+        _notify_progress(progress, progress_end, f"{progress_label}: no parsed files to inspect")
+        return edges, unresolved
+    _notify_progress(progress, progress_start, f"{progress_label}: scanning 0/{total_files} parsed files…")
+    update_every = max(1, total_files // 40)
+    for index, (path, source) in enumerate(source_map.items(), start=1):
         try:
             tree = _parser_for(Path(path)).parse(source)
         except ValueError:
+            if index == total_files or index % update_every == 0:
+                value = progress_start + (progress_end - progress_start) * index / total_files
+                _notify_progress(progress, value, f"{progress_label}: scanned {index}/{total_files} files")
             continue
         function_nodes = {
             node.start_point.row + 1: node
@@ -307,27 +354,58 @@ def _build_edges(root: Path, functions: dict[str, Function], source_map: dict[st
                     control_coupling=sorted(set(control)),
                     control_context=_under_control_body(call),
                 ))
+        if index == total_files or index % update_every == 0:
+            value = progress_start + (progress_end - progress_start) * index / total_files
+            _notify_progress(progress, value, f"{progress_label}: scanned {index}/{total_files} files; found {len(edges)} edges")
     return edges, unresolved
 
 
-def _snapshot(root: Path, ref: str, config: dict[str, Any]) -> tuple[dict[str, Function], list[CallEdge], list[str], list[str]]:
+def _snapshot(
+    root: Path,
+    ref: str,
+    config: dict[str, Any],
+    progress: ProgressCallback | None = None,
+) -> tuple[dict[str, Function], list[CallEdge], list[str], list[str]]:
+    _notify_progress(progress, None, f"Listing C/C++ files in baseline ref {ref}…")
     listing = subprocess.run(["git", "ls-tree", "-r", "--name-only", ref], cwd=root, text=True, capture_output=True)
     if listing.returncode:
         raise RuntimeError(f"cannot read Git ref {ref}: {listing.stderr.strip()}")
+    items = [
+        item for item in listing.stdout.splitlines()
+        if Path(item).suffix in EXTENSIONS and not any(part in SKIP_DIRS for part in Path(item).parts)
+    ]
+    total_files = len(items)
+    update_every = max(1, total_files // 40)
+    _notify_progress(progress, 42, f"Reading baseline source blobs: 0/{total_files} files")
     with tempfile.TemporaryDirectory(prefix="ccdc-baseline-") as temp:
         temp_root = Path(temp)
-        for item in listing.stdout.splitlines():
+        for index, item in enumerate(items, start=1):
             rel = Path(item)
-            if rel.suffix not in EXTENSIONS or any(part in SKIP_DIRS for part in rel.parts):
-                continue
             blob = subprocess.run(["git", "show", f"{ref}:{item}"], cwd=root, capture_output=True)
-            if blob.returncode:
-                continue
-            target = temp_root / rel
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(blob.stdout)
-        functions, source_map, warnings = _find_functions(temp_root, config)
-        edges, unresolved = _build_edges(temp_root, functions, source_map)
+            if blob.returncode == 0:
+                target = temp_root / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(blob.stdout)
+            if total_files and (index == total_files or index % update_every == 0):
+                percent = 42 + 18 * index / total_files
+                _notify_progress(progress, percent, f"Reading baseline source blobs: {index}/{total_files} files")
+        functions, source_map, warnings = _find_functions(
+            temp_root,
+            config,
+            progress,
+            progress_start=60,
+            progress_end=75,
+            progress_label="Parsing baseline source",
+        )
+        edges, unresolved = _build_edges(
+            temp_root,
+            functions,
+            source_map,
+            progress,
+            progress_start=75,
+            progress_end=83,
+            progress_label="Resolving baseline CC/DC calls",
+        )
         return functions, edges, warnings, unresolved
 
 
@@ -335,25 +413,43 @@ def _edge_key(edge: CallEdge) -> tuple[Any, ...]:
     return (edge.caller, edge.callee, tuple(edge.arguments), tuple(edge.data_coupling), tuple(edge.control_coupling), edge.control_context)
 
 
-def analyze_change(repo: Path, base_ref: str, head_ref: str, issue: dict[str, Any], out_dir: Path, config_path: Path | None = None, repo_label: str | None = None) -> dict[str, Path]:
+def analyze_change(
+    repo: Path,
+    base_ref: str,
+    head_ref: str,
+    issue: dict[str, Any],
+    out_dir: Path,
+    config_path: Path | None = None,
+    repo_label: str | None = None,
+    progress: ProgressCallback | None = None,
+) -> dict[str, Path]:
     repo = repo.resolve()
+    _notify_progress(progress, None, "Reading analysis configuration and comparing Git refs…")
     config = {}
     candidate_config = config_path or (repo / "ccdc.json")
     if candidate_config.exists():
         config = json.loads(candidate_config.read_text(encoding="utf-8"))
+    _notify_progress(progress, None, "Identifying changed C/C++ files in the selected Git range…")
     changed = subprocess.run(["git", "diff", "--name-only", f"{base_ref}...{head_ref}"], cwd=repo, text=True, capture_output=True)
     if changed.returncode:
         raise RuntimeError(f"git diff failed: {changed.stderr.strip()}")
     changed_paths = [p for p in changed.stdout.splitlines() if Path(p).suffix in EXTENSIONS]
+    _notify_progress(progress, 4, f"Found {len(changed_paths)} changed C/C++ files; checking out {head_ref}…")
 
     # Analyze the selected head in the disposable clone, not the user's working tree.
     checkout = subprocess.run(["git", "checkout", "--detach", head_ref], cwd=repo, text=True, capture_output=True)
     if checkout.returncode:
         raise RuntimeError(f"cannot check out selected head {head_ref}: {checkout.stderr.strip()}")
-    functions, source_map, warnings = _find_functions(repo, config)
-    current_edges, unresolved = _build_edges(repo, functions, source_map)
-    base_functions, base_edges, base_warnings, base_unresolved = _snapshot(repo, base_ref, config)
+    _notify_progress(progress, 6, f"Scanning current C/C++ source in {head_ref}…")
+    functions, source_map, warnings = _find_functions(
+        repo, config, progress, progress_start=6, progress_end=29, progress_label="Parsing current source"
+    )
+    current_edges, unresolved = _build_edges(
+        repo, functions, source_map, progress, progress_start=29, progress_end=40, progress_label="Resolving current CC/DC calls"
+    )
+    base_functions, base_edges, base_warnings, base_unresolved = _snapshot(repo, base_ref, config, progress)
 
+    _notify_progress(progress, None, "Comparing current and baseline call/coupling graphs…")
     changed_functions = sorted({
         fid for group in (functions, base_functions)
         for fid, fn in group.items() if fn.path in changed_paths
@@ -393,12 +489,14 @@ def analyze_change(repo: Path, base_ref: str, head_ref: str, issue: dict[str, An
                 impacted.add(child)
                 queue.append(child)
 
+    _notify_progress(progress, 87, f"Impact traced to {len(impacted)} functions; mapping requirements and regression tests…")
     reqs = config.get("requirements", {})
     tests = config.get("tests", {})
     affected_reqs = {key: value for key, value in reqs.items() if any(symbol in impacted for symbol in value)}
     affected_req_keys = set(affected_reqs)
     selected_tests = {key: req_ids for key, req_ids in tests.items() if affected_req_keys.intersection(req_ids)}
     relevant_edges = [e for e in edges if e.caller in impacted or e.callee in impacted]
+    _notify_progress(progress, None, "Generating source diff and revision metadata…")
     diff = subprocess.run(["git", "diff", "--no-ext-diff", "--unified=3", f"{base_ref}...{head_ref}", "--", *changed_paths], cwd=repo, text=True, capture_output=True)
     revision = subprocess.run(["git", "rev-parse", head_ref], cwd=repo, text=True, capture_output=True)
     report = {
@@ -436,12 +534,16 @@ def analyze_change(repo: Path, base_ref: str, head_ref: str, issue: dict[str, An
         "mermaid_png": out_dir / "impact-flow.png",
         "diff": out_dir / "source-diff.patch",
     }
+    _notify_progress(progress, 91, "Writing JSON findings, source diff, and Mermaid source…")
     paths["json"].write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     paths["diff"].write_text(diff.stdout, encoding="utf-8")
     mermaid_source = _mermaid(report)
     paths["mermaid"].write_text(mermaid_source, encoding="utf-8")
+    _notify_progress(progress, None, "Rendering the Mermaid source to SVG and PNG…")
     _render_mermaid(mermaid_source, paths["mermaid_svg"], paths["mermaid_png"])
+    _notify_progress(progress, 98, "Writing the human-readable impact report…")
     paths["markdown"].write_text(_markdown(report), encoding="utf-8")
+    _notify_progress(progress, 99, "Report files and rendered Mermaid diagram have been generated")
     return paths
 
 
