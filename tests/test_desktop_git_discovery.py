@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from ccdc_local.cli import _normalize_repo_url
-from ccdc_local.desktop import DesktopApp, discover_git_issues, flow_node_layers
+from ccdc_local.desktop import DesktopApp, discover_git_issues, flow_node_layers, resolve_scr_range
 
 
 class GitUrlNormalizationTests(unittest.TestCase):
@@ -65,13 +65,46 @@ class GitScrDiscoveryTests(unittest.TestCase):
             subprocess.run(["git", "checkout", "-b", "feature/SCR-42-scaling"], cwd=source, check=True, capture_output=True)
             (source / "unit.c").write_text("int value(void) { return 42; }\n", encoding="utf-8")
             subprocess.run(["git", "commit", "-am", "Correct scaling for SCR-42"], cwd=source, check=True, capture_output=True)
+            subprocess.run(["git", "checkout", "main"], cwd=source, check=True, capture_output=True)
+            subprocess.run(["git", "checkout", "-b", "topic/unlabelled"], cwd=source, check=True, capture_output=True)
+            (source / "unit.c").write_text("int value(void) { return 7; }\n", encoding="utf-8")
+            subprocess.run(["git", "commit", "-am", "Tune behavior for SCR-43"], cwd=source, check=True, capture_output=True)
+            (source / "unit.c").write_text("int value(void) { return 8; }\n", encoding="utf-8")
+            subprocess.run(["git", "commit", "-am", "Unrelated cleanup"], cwd=source, check=True, capture_output=True)
+            (source / "unit.c").write_text("int value(void) { return 9; }\n", encoding="utf-8")
+            subprocess.run(["git", "commit", "-am", "Finalize behavior for SCR-43"], cwd=source, check=True, capture_output=True)
+            subprocess.run(["git", "checkout", "main"], cwd=source, check=True, capture_output=True)
+            subprocess.run(["git", "checkout", "-b", "topic/commit-only"], cwd=source, check=True, capture_output=True)
+            (source / "unit.c").write_text("int value(void) { return 44; }\n", encoding="utf-8")
+            subprocess.run(["git", "commit", "-am", "Tune behavior for SCR-44"], cwd=source, check=True, capture_output=True)
 
-            session = DesktopApp._inspect_repo(str(source))
+            progress_events = []
+            session = DesktopApp._inspect_repo(
+                str(source), progress=lambda percent, message: progress_events.append((percent, message))
+            )
             try:
                 self.assertTrue(any(issue["key"] == "SCR-42" for issue in session["discovered_issues"]))
-                self.assertIn("feature/SCR-42-scaling", session["refs"])
-                self.assertIn("Correct scaling for SCR-42", session["recent_commits"][0]["subject"])
+                self.assertTrue(any(ref.endswith("feature/SCR-42-scaling") for ref in session["refs"]))
+                self.assertTrue(any("Correct scaling for SCR-42" in commit["subject"] for commit in session["recent_commits"]))
                 self.assertTrue(session["default_base"])
+                self.assertTrue(any("Scanning commit messages for SCR keys: 6/6" in message for _percent, message in progress_events))
+                branch_range, branch_reason = resolve_scr_range(session, {"key": "SCR-42"})
+                self.assertFalse(branch_reason)
+                self.assertEqual(branch_range["base_ref"], session["default_base"])
+                self.assertTrue(branch_range["head_ref"].endswith("feature/SCR-42-scaling"))
+                commit_range, commit_reason = resolve_scr_range(session, {"key": "SCR-44"})
+                self.assertFalse(commit_reason)
+                self.assertEqual(commit_range["strategy"], "matching SCR commit range")
+                self.assertNotEqual(commit_range["base_ref"], commit_range["head_ref"])
+                unsafe_range, unsafe_reason = resolve_scr_range(session, {"key": "SCR-43"})
+                self.assertIsNone(unsafe_range)
+                self.assertIn("non-contiguous", unsafe_reason)
+                no_match, no_match_reason = resolve_scr_range(session, {"key": "SCR-999"})
+                self.assertIsNone(no_match)
+                self.assertIn("No safe Git range", no_match_reason)
+                percentages = [percent for percent, _message in progress_events if percent is not None]
+                self.assertEqual(percentages, sorted(percentages))
+                self.assertEqual(percentages[-1], 99)
             finally:
                 session["tempdir"].cleanup()
 

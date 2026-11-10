@@ -5,10 +5,10 @@ import os
 import re
 import subprocess
 import tempfile
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from tree_sitter import Language, Parser
 import tree_sitter_c
@@ -16,6 +16,17 @@ import tree_sitter_cpp
 
 EXTENSIONS = {".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx", ".C", ".H"}
 SKIP_DIRS = {".git", ".svn", "build", "dist", "out", "target", "vendor", "third_party", "node_modules", ".venv", "venv"}
+ProgressCallback = Callable[[float | None, str], None]
+MAX_MERMAID_FUNCTIONS = 40
+MAX_MERMAID_EDGES = 100
+MERMAID_MAX_TEXT_SIZE = 200_000
+MERMAID_PNG_MAX_WIDTH = 2400
+MERMAID_PNG_MAX_HEIGHT = 1800
+
+
+def _notify_progress(progress: ProgressCallback | None, value: float | None, message: str) -> None:
+    if progress is not None:
+        progress(value, message)
 
 
 @dataclass
@@ -179,22 +190,45 @@ def _component_for(path: str, config: dict[str, Any]) -> str:
     return parts[0] if len(parts) > 1 else "root"
 
 
-def _find_functions(root: Path, config: dict[str, Any]) -> tuple[dict[str, Function], dict[str, bytes], list[str]]:
+def _find_functions(
+    root: Path,
+    config: dict[str, Any],
+    progress: ProgressCallback | None = None,
+    progress_start: float = 0.0,
+    progress_end: float = 100.0,
+    progress_label: str = "Parsing source",
+) -> tuple[dict[str, Function], dict[str, bytes], list[str]]:
     functions: dict[str, Function] = {}
     source_map: dict[str, bytes] = {}
     parse_warnings: list[str] = []
     files = []
+    _notify_progress(progress, None, f"{progress_label}: locating C/C++ files…")
     for directory, subdirs, filenames in os.walk(root):
         subdirs[:] = sorted(name for name in subdirs if name not in SKIP_DIRS)
         base = Path(directory)
         files.extend(base / name for name in filenames if Path(name).suffix in EXTENSIONS)
-    for path in sorted(files):
+    files = sorted(files)
+    total_files = len(files)
+    if total_files:
+        _notify_progress(progress, progress_start, f"{progress_label}: parsing 0/{total_files} source files…")
+    else:
+        _notify_progress(progress, progress_end, f"{progress_label}: no C/C++ source files found")
+    update_every = max(1, total_files // 40)
+
+    def report_file_progress(index: int) -> None:
+        if total_files and (index == total_files or index % update_every == 0):
+            fraction = index / total_files
+            value = progress_start + (progress_end - progress_start) * fraction
+            _notify_progress(progress, value, f"{progress_label}: parsed {index}/{total_files} source files")
+
+    for index, path in enumerate(files, start=1):
         relative = path.relative_to(root).as_posix()
         try:
             source = path.read_bytes()
             tree = _parser_for(path).parse(source)
         except (OSError, ValueError) as exc:
             parse_warnings.append(f"{relative}: parse/read error: {exc}")
+            report_file_progress(index)
             continue
         source_map[relative] = source
         if tree.root_node.has_error:
@@ -221,6 +255,7 @@ def _find_functions(root: Path, config: dict[str, Any]) -> tuple[dict[str, Funct
                 component=_component_for(relative, config),
                 arity=len(params),
             )
+        report_file_progress(index)
     return functions, source_map, parse_warnings
 
 
@@ -250,16 +285,33 @@ def _under_control_body(call_node) -> bool:
     return False
 
 
-def _build_edges(root: Path, functions: dict[str, Function], source_map: dict[str, bytes]) -> tuple[list[CallEdge], list[str]]:
+def _build_edges(
+    root: Path,
+    functions: dict[str, Function],
+    source_map: dict[str, bytes],
+    progress: ProgressCallback | None = None,
+    progress_start: float = 0.0,
+    progress_end: float = 100.0,
+    progress_label: str = "Resolving call and coupling edges",
+) -> tuple[list[CallEdge], list[str]]:
     by_simple: dict[str, list[Function]] = defaultdict(list)
     for fn in functions.values():
         by_simple[_simple_name(fn.name)].append(fn)
     edges: list[CallEdge] = []
     unresolved: list[str] = []
-    for path, source in source_map.items():
+    total_files = len(source_map)
+    if not total_files:
+        _notify_progress(progress, progress_end, f"{progress_label}: no parsed files to inspect")
+        return edges, unresolved
+    _notify_progress(progress, progress_start, f"{progress_label}: scanning 0/{total_files} parsed files…")
+    update_every = max(1, total_files // 40)
+    for index, (path, source) in enumerate(source_map.items(), start=1):
         try:
             tree = _parser_for(Path(path)).parse(source)
         except ValueError:
+            if index == total_files or index % update_every == 0:
+                value = progress_start + (progress_end - progress_start) * index / total_files
+                _notify_progress(progress, value, f"{progress_label}: scanned {index}/{total_files} files")
             continue
         function_nodes = {
             node.start_point.row + 1: node
@@ -307,27 +359,58 @@ def _build_edges(root: Path, functions: dict[str, Function], source_map: dict[st
                     control_coupling=sorted(set(control)),
                     control_context=_under_control_body(call),
                 ))
+        if index == total_files or index % update_every == 0:
+            value = progress_start + (progress_end - progress_start) * index / total_files
+            _notify_progress(progress, value, f"{progress_label}: scanned {index}/{total_files} files; found {len(edges)} edges")
     return edges, unresolved
 
 
-def _snapshot(root: Path, ref: str, config: dict[str, Any]) -> tuple[dict[str, Function], list[CallEdge], list[str], list[str]]:
+def _snapshot(
+    root: Path,
+    ref: str,
+    config: dict[str, Any],
+    progress: ProgressCallback | None = None,
+) -> tuple[dict[str, Function], list[CallEdge], list[str], list[str]]:
+    _notify_progress(progress, None, f"Listing C/C++ files in baseline ref {ref}…")
     listing = subprocess.run(["git", "ls-tree", "-r", "--name-only", ref], cwd=root, text=True, capture_output=True)
     if listing.returncode:
         raise RuntimeError(f"cannot read Git ref {ref}: {listing.stderr.strip()}")
+    items = [
+        item for item in listing.stdout.splitlines()
+        if Path(item).suffix in EXTENSIONS and not any(part in SKIP_DIRS for part in Path(item).parts)
+    ]
+    total_files = len(items)
+    update_every = max(1, total_files // 40)
+    _notify_progress(progress, 42, f"Reading baseline source blobs: 0/{total_files} files")
     with tempfile.TemporaryDirectory(prefix="ccdc-baseline-") as temp:
         temp_root = Path(temp)
-        for item in listing.stdout.splitlines():
+        for index, item in enumerate(items, start=1):
             rel = Path(item)
-            if rel.suffix not in EXTENSIONS or any(part in SKIP_DIRS for part in rel.parts):
-                continue
             blob = subprocess.run(["git", "show", f"{ref}:{item}"], cwd=root, capture_output=True)
-            if blob.returncode:
-                continue
-            target = temp_root / rel
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(blob.stdout)
-        functions, source_map, warnings = _find_functions(temp_root, config)
-        edges, unresolved = _build_edges(temp_root, functions, source_map)
+            if blob.returncode == 0:
+                target = temp_root / rel
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(blob.stdout)
+            if total_files and (index == total_files or index % update_every == 0):
+                percent = 42 + 18 * index / total_files
+                _notify_progress(progress, percent, f"Reading baseline source blobs: {index}/{total_files} files")
+        functions, source_map, warnings = _find_functions(
+            temp_root,
+            config,
+            progress,
+            progress_start=60,
+            progress_end=75,
+            progress_label="Parsing baseline source",
+        )
+        edges, unresolved = _build_edges(
+            temp_root,
+            functions,
+            source_map,
+            progress,
+            progress_start=75,
+            progress_end=83,
+            progress_label="Resolving baseline CC/DC calls",
+        )
         return functions, edges, warnings, unresolved
 
 
@@ -335,25 +418,43 @@ def _edge_key(edge: CallEdge) -> tuple[Any, ...]:
     return (edge.caller, edge.callee, tuple(edge.arguments), tuple(edge.data_coupling), tuple(edge.control_coupling), edge.control_context)
 
 
-def analyze_change(repo: Path, base_ref: str, head_ref: str, issue: dict[str, Any], out_dir: Path, config_path: Path | None = None, repo_label: str | None = None) -> dict[str, Path]:
+def analyze_change(
+    repo: Path,
+    base_ref: str,
+    head_ref: str,
+    issue: dict[str, Any],
+    out_dir: Path,
+    config_path: Path | None = None,
+    repo_label: str | None = None,
+    progress: ProgressCallback | None = None,
+) -> dict[str, Path]:
     repo = repo.resolve()
+    _notify_progress(progress, None, "Reading analysis configuration and comparing Git refs…")
     config = {}
     candidate_config = config_path or (repo / "ccdc.json")
     if candidate_config.exists():
         config = json.loads(candidate_config.read_text(encoding="utf-8"))
+    _notify_progress(progress, None, "Identifying changed C/C++ files in the selected Git range…")
     changed = subprocess.run(["git", "diff", "--name-only", f"{base_ref}...{head_ref}"], cwd=repo, text=True, capture_output=True)
     if changed.returncode:
         raise RuntimeError(f"git diff failed: {changed.stderr.strip()}")
     changed_paths = [p for p in changed.stdout.splitlines() if Path(p).suffix in EXTENSIONS]
+    _notify_progress(progress, 4, f"Found {len(changed_paths)} changed C/C++ files; checking out {head_ref}…")
 
     # Analyze the selected head in the disposable clone, not the user's working tree.
     checkout = subprocess.run(["git", "checkout", "--detach", head_ref], cwd=repo, text=True, capture_output=True)
     if checkout.returncode:
         raise RuntimeError(f"cannot check out selected head {head_ref}: {checkout.stderr.strip()}")
-    functions, source_map, warnings = _find_functions(repo, config)
-    current_edges, unresolved = _build_edges(repo, functions, source_map)
-    base_functions, base_edges, base_warnings, base_unresolved = _snapshot(repo, base_ref, config)
+    _notify_progress(progress, 6, f"Scanning current C/C++ source in {head_ref}…")
+    functions, source_map, warnings = _find_functions(
+        repo, config, progress, progress_start=6, progress_end=29, progress_label="Parsing current source"
+    )
+    current_edges, unresolved = _build_edges(
+        repo, functions, source_map, progress, progress_start=29, progress_end=40, progress_label="Resolving current CC/DC calls"
+    )
+    base_functions, base_edges, base_warnings, base_unresolved = _snapshot(repo, base_ref, config, progress)
 
+    _notify_progress(progress, None, "Comparing current and baseline call/coupling graphs…")
     changed_functions = sorted({
         fid for group in (functions, base_functions)
         for fid, fn in group.items() if fn.path in changed_paths
@@ -393,12 +494,14 @@ def analyze_change(repo: Path, base_ref: str, head_ref: str, issue: dict[str, An
                 impacted.add(child)
                 queue.append(child)
 
+    _notify_progress(progress, 87, f"Impact traced to {len(impacted)} functions; mapping requirements and regression tests…")
     reqs = config.get("requirements", {})
     tests = config.get("tests", {})
     affected_reqs = {key: value for key, value in reqs.items() if any(symbol in impacted for symbol in value)}
     affected_req_keys = set(affected_reqs)
     selected_tests = {key: req_ids for key, req_ids in tests.items() if affected_req_keys.intersection(req_ids)}
     relevant_edges = [e for e in edges if e.caller in impacted or e.callee in impacted]
+    _notify_progress(progress, None, "Generating source diff and revision metadata…")
     diff = subprocess.run(["git", "diff", "--no-ext-diff", "--unified=3", f"{base_ref}...{head_ref}", "--", *changed_paths], cwd=repo, text=True, capture_output=True)
     revision = subprocess.run(["git", "rev-parse", head_ref], cwd=repo, text=True, capture_output=True)
     report = {
@@ -436,12 +539,16 @@ def analyze_change(repo: Path, base_ref: str, head_ref: str, issue: dict[str, An
         "mermaid_png": out_dir / "impact-flow.png",
         "diff": out_dir / "source-diff.patch",
     }
+    _notify_progress(progress, 91, "Writing JSON findings, source diff, and Mermaid source…")
     paths["json"].write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     paths["diff"].write_text(diff.stdout, encoding="utf-8")
     mermaid_source = _mermaid(report)
     paths["mermaid"].write_text(mermaid_source, encoding="utf-8")
+    _notify_progress(progress, None, "Rendering the Mermaid source to SVG and PNG…")
     _render_mermaid(mermaid_source, paths["mermaid_svg"], paths["mermaid_png"])
+    _notify_progress(progress, 98, "Writing the human-readable impact report…")
     paths["markdown"].write_text(_markdown(report), encoding="utf-8")
+    _notify_progress(progress, 99, "Report files and rendered Mermaid diagram have been generated")
     return paths
 
 
@@ -449,9 +556,23 @@ def _render_mermaid(source: str, svg_path: Path, png_path: Path) -> None:
     """Render the exact Mermaid source with Mermaid.js via the local mermaidx engine."""
     import mermaidx
 
-    diagram = mermaidx.render(source, backend="js:mermaid")
-    diagram.save(str(svg_path), format="svg")
-    diagram.save(str(png_path), scale=2, background="#ffffff", format="png")
+    diagram = mermaidx.render(
+        source,
+        backend="js:mermaid",
+        config={"maxTextSize": MERMAID_MAX_TEXT_SIZE},
+    )
+    svg = diagram.svg()
+    svg_path.write_text(svg, encoding="utf-8")
+    view_box = re.search(r'viewBox="([^"]+)"', svg)
+    if view_box:
+        dimensions = [float(item) for item in view_box.group(1).split()]
+        view_width, view_height = dimensions[2:4]
+    else:
+        view_width, view_height = MERMAID_PNG_MAX_WIDTH, MERMAID_PNG_MAX_HEIGHT
+    scale = min(MERMAID_PNG_MAX_WIDTH / view_width, MERMAID_PNG_MAX_HEIGHT / view_height)
+    png_width = max(1, round(view_width * scale))
+    png_height = max(1, round(view_height * scale))
+    png_path.write_bytes(diagram.png(width=png_width, height=png_height, background="#ffffff"))
 
 
 def _markdown(report: dict[str, Any]) -> str:
@@ -514,35 +635,80 @@ def _markdown(report: dict[str, Any]) -> str:
     lines += ["", "## Parse and resolution notes"]
     notes = report["parse_warnings"] + report["unresolved_calls"]
     lines += [f"- {note}" for note in notes] or ["- No parser warnings or ambiguous calls reported."]
-    lines += ["", "## Flow diagram", "The accompanying `impact-flow.mmd` is rendered locally by Mermaid.js into `impact-flow.svg` and `impact-flow.png`; the desktop GUI displays the rendered PNG.", "", "## Source diff", "See the accompanying `source-diff.patch`.", "", "## Limitations"]
+    lines += ["", "## Flow diagram", f"The accompanying `impact-flow.mmd` is rendered locally by Mermaid.js into `impact-flow.svg` and `impact-flow.png`; the desktop GUI displays the rendered PNG. For readability and renderer stability, this diagram is capped at {MAX_MERMAID_FUNCTIONS} functions and {MAX_MERMAID_EDGES} edges. Full findings remain available in the edge-details table and JSON.", "", "## Source diff", "See the accompanying `source-diff.patch`.", "", "## Limitations"]
     lines += [f"- {x}" for x in report["limitations"]]
     return "\n".join(lines) + "\n"
 
 
 def _mermaid(report: dict[str, Any]) -> str:
-    lines = ["flowchart LR"]
-    changed, impacted = set(report["changed_functions"]), set(report["impacted_functions"])
-    names = set(changed) | set(impacted)
-    for edge in report["edges"]:
-        names.update((edge["caller"], edge["callee"]))
-    ids = {name: f"N{index}" for index, name in enumerate(sorted(names))}
+    """Build a readable Mermaid view, capped so large repositories remain renderable."""
+    edges = report.get("edges", [])
+    changed = set(report.get("changed_functions", []))
+    impacted = set(report.get("impacted_functions", []))
+    all_names = changed | impacted
+    neighbors: dict[str, set[str]] = defaultdict(set)
+    for edge in edges:
+        caller, callee = edge.get("caller"), edge.get("callee")
+        if caller and callee:
+            all_names.update((caller, callee))
+            neighbors[caller].add(callee)
+            neighbors[callee].add(caller)
+
+    # Keep the changed functions and their nearest callers/callees first; full
+    # findings remain available in JSON and the edge-details table.
+    distance: dict[str, int] = {}
+    queue = deque()
+    for name in sorted(changed & all_names):
+        distance[name] = 0
+        queue.append(name)
+    while queue:
+        name = queue.popleft()
+        for neighbor in sorted(neighbors[name]):
+            if neighbor not in distance:
+                distance[neighbor] = distance[name] + 1
+                queue.append(neighbor)
+    ordered_names = sorted(all_names, key=lambda name: (distance.get(name, float("inf")), name))
+    selected_names = set(ordered_names[:MAX_MERMAID_FUNCTIONS])
+    connected_edges = [
+        edge for edge in edges
+        if edge.get("caller") in selected_names and edge.get("callee") in selected_names
+    ]
+    connected_edges.sort(key=lambda edge: (
+        distance.get(edge.get("caller", ""), float("inf")) + distance.get(edge.get("callee", ""), float("inf")),
+        edge.get("caller", ""), edge.get("callee", ""), edge.get("path", ""), edge.get("line", 0),
+    ))
+    selected_edges = connected_edges[:MAX_MERMAID_EDGES]
+    omitted_functions = len(all_names) - len(selected_names)
+    omitted_edges = len(edges) - len(selected_edges)
+
+    lines = [
+        "flowchart LR",
+        f"%% Showing {len(selected_names)} of {len(all_names)} functions and {len(selected_edges)} of {len(edges)} edges.",
+    ]
+    ids = {name: f"N{index}" for index, name in enumerate(sorted(selected_names))}
     for name, node_id in ids.items():
-        label = name.replace('"', "'")
+        label = name.replace('"', "'").replace("\n", " ")
+        if len(label) > 120:
+            label = label[:117] + "..."
         lines.append(f'  {node_id}["{label}"]')
-    for edge in report["edges"]:
+    for edge in selected_edges:
         kinds = []
-        if "control" in edge["coupling_types"]:
+        coupling_types = edge.get("coupling_types", [])
+        if "control" in coupling_types:
             kinds.append("CC · Control Coupling")
-        if "data" in edge["coupling_types"]:
+        if "data" in coupling_types:
             kinds.append("DC · Data Coupling")
         label = " + ".join(kinds) or "Call"
-        label += f" · {edge['state']}"
+        label += f" · {edge.get('state', 'current')}"
         lines.append(f'  {ids[edge["caller"]]} -->|"{label}"| {ids[edge["callee"]]}')
     for name, node_id in ids.items():
         if name in changed:
             lines.append(f"  style {node_id} fill:#ffd6d6,stroke:#c00,stroke-width:3px")
         elif name in impacted:
             lines.append(f"  style {node_id} fill:#fff0c2,stroke:#a66b00,stroke-width:2px")
-    if len(lines) == 1:
+    if omitted_functions or omitted_edges:
+        lines.append(f'  More["Diagram limit: {omitted_functions} functions and {omitted_edges} edges omitted. See Edge Details / JSON for all findings."]')
+        lines.append("  style More fill:#f3f4f6,stroke:#64748b,stroke-dasharray: 5 5")
+    if not selected_names:
         lines.append('  Empty["No resolved flows"]')
     return "\n".join(lines) + "\n"

@@ -18,7 +18,7 @@ except ModuleNotFoundError:  # Tkinter ships with python.org Python on Windows/m
     tk = None  # type: ignore[assignment]
     filedialog = messagebox = ttk = None  # type: ignore[assignment]
 
-from .analyzer import analyze_change
+from .analyzer import ProgressCallback, analyze_change
 from .cli import _clone_repo, _default_base, _git
 from .jira import JiraClient
 
@@ -26,7 +26,11 @@ ISSUE_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]+-\d+$")
 ISSUE_KEY_SCAN_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b", re.IGNORECASE)
 
 
-def discover_git_issues(refs: list[str], commits: list[dict[str, str]]) -> tuple[list[dict[str, Any]], dict[str, dict[str, list[Any]]]]:
+def discover_git_issues(
+    refs: list[str],
+    commits: list[dict[str, str]],
+    progress: Callable[[int, int], None] | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, dict[str, list[Any]]]]:
     """Collect SCR-like keys from refs and recent commit subjects without Jira."""
     matches: dict[str, dict[str, list[Any]]] = {}
 
@@ -39,11 +43,15 @@ def discover_git_issues(refs: list[str], commits: list[dict[str, str]]) -> tuple
             branches = ensure(key)["branches"]
             if ref not in branches:
                 branches.append(ref)
-    for commit in commits:
+    total_commits = len(commits)
+    update_every = max(1, total_commits // 40)
+    for index, commit in enumerate(commits, start=1):
         for key in ISSUE_KEY_SCAN_RE.findall(commit.get("subject", "")):
             bucket = ensure(key)["commits"]
             if commit not in bucket:
                 bucket.append(commit)
+        if progress and (index == total_commits or index % update_every == 0):
+            progress(index, total_commits)
 
     issues = []
     for key, found in matches.items():
@@ -59,7 +67,100 @@ def discover_git_issues(refs: list[str], commits: list[dict[str, str]]) -> tuple
     return issues, matches
 
 
+def resolve_scr_range(
+    session: dict[str, Any],
+    issue: dict[str, Any],
+    progress: ProgressCallback | None = None,
+) -> tuple[dict[str, str] | None, str]:
+    """Infer a safe base/head pair from SCR-named refs or matching commit history."""
+    key = issue.get("key", "").upper()
+    repo = session["path"]
+    matches = session.get("issue_matches", {}).get(key, {"branches": [], "commits": []})
+    branches = list(dict.fromkeys(matches.get("branches", [])))
+    commits = matches.get("commits", [])
+    default_base = session.get("default_base", "HEAD")
+    if progress:
+        progress(None, f"Matching {key} to a Git branch or commit range…")
+
+    base_sha = _git(["rev-parse", "--verify", f"{default_base}^{{commit}}"], repo, check=False)
+    branch_candidates = []
+    for branch in branches:
+        tip_sha = _git(["rev-parse", "--verify", f"{branch}^{{commit}}"], repo, check=False)
+        if not tip_sha or tip_sha == base_sha:
+            continue
+        common = _git(["merge-base", default_base, branch], repo, check=False)
+        if not common or common == tip_sha:
+            continue  # Already contained in the default branch; use the commit range below.
+        timestamp = _git(["log", "-1", "--format=%ct", branch], repo, check=False)
+        try:
+            commit_time = int(timestamp)
+        except ValueError:
+            commit_time = 0
+        branch_candidates.append((commit_time, branch))
+    if branch_candidates:
+        _, head_ref = max(branch_candidates)
+        resolved = {
+            "base_ref": default_base,
+            "head_ref": head_ref,
+            "strategy": "SCR-matching branch against the repository default branch",
+            "evidence": f"Branch `{head_ref}` contains {key}.",
+        }
+        if progress:
+            progress(None, f"Using {head_ref} against {default_base}; checking out the SCR-matching branch…")
+        return resolved, ""
+
+    # Commit-subject matching is safe only when SCR-tagged commits form one
+    # uninterrupted first-parent sequence. Otherwise a range would silently
+    # include unrelated commits between matching messages.
+    if commits:
+        head_ref = commits[0]["ref"]
+        head_sha = _git(["rev-parse", "--verify", f"{head_ref}^{{commit}}"], repo, check=False)
+        matching_shas = {item["ref"] for item in commits}
+        history = _git(
+            ["log", "--first-parent", "--format=%H%x09%P%x09%s", head_sha],
+            repo,
+            check=False,
+        ).splitlines() if head_sha else []
+        history_parts = [line.split("\t", 2) for line in history]
+        matching_positions = [
+            index for index, parts in enumerate(history_parts)
+            if parts[0] in matching_shas
+        ]
+        if matching_positions:
+            oldest_index = max(matching_positions)
+            segment = history_parts[:oldest_index + 1]
+            segment_has_only_scr_commits = all(
+                len(parts) == 3 and key in {match.upper() for match in ISSUE_KEY_SCAN_RE.findall(parts[2])}
+                for parts in segment
+            )
+            # A merge introduces side-branch changes not represented by its
+            # first-parent subject; leave those ranges for explicit review.
+            contains_merge = any(len(parts[1].split()) > 1 for parts in segment if len(parts) == 3)
+            oldest = segment[-1][0]
+            parent_refs = segment[-1][1].split() if len(segment[-1]) == 3 else []
+            if segment_has_only_scr_commits and not contains_merge and len(parent_refs) == 1:
+                base_ref = parent_refs[0]
+                if _git(["merge-base", base_ref, head_ref], repo, check=False):
+                    commit_count = len(segment)
+                    resolved = {
+                        "base_ref": base_ref,
+                        "head_ref": head_ref,
+                        "strategy": "matching SCR commit range",
+                        "evidence": f"{commit_count} contiguous {key} commit(s), from {oldest[:10]} through {head_ref[:10]}.",
+                    }
+                    if progress:
+                        progress(None, f"Using the matching SCR commit range ({commit_count} contiguous commit(s))…")
+                    return resolved, ""
+
+    reason = (
+        f"No safe Git range could be inferred for {key}. Matching commits are absent, non-contiguous, "
+        "or involve a merge/root commit. Include the SCR key on every commit in the change or use the optional manual range."
+    )
+    return None, reason
+
+
 def flow_node_layers(report: dict[str, Any]) -> dict[str, int]:
+
     """Place changed functions at the center and connected call-flow nodes around them."""
     edges = report.get("edges", [])
     nodes = set(report.get("changed_functions", [])) | set(report.get("impacted_functions", []))
@@ -129,6 +230,8 @@ class DesktopApp:
         self.repo_session: dict[str, Any] | None = None
         self.report_paths: dict[str, Path] = {}
         self._busy = False
+        self._progress_animation_running = False
+        self._progress_reset_id: str | None = None
         self._build_ui()
         self.root.protocol("WM_DELETE_WINDOW", self._close)
         self._toggle_mode()
@@ -226,10 +329,21 @@ class DesktopApp:
         self.load_button.pack(side="left")
         self.status_label = ttk.Label(actions, textvariable=self.status)
         self.status_label.pack(side="left", padx=(12, 0))
+        self.progress_frame = ttk.Frame(source)
+        self.progress_frame.grid(row=7, column=0, columnspan=4, sticky="ew", pady=(8, 0))
+        self.progress_detail = tk.StringVar(value="")
+        self.progress_percent = tk.StringVar(value="")
+        ttk.Label(self.progress_frame, textvariable=self.progress_detail, anchor="w").grid(row=0, column=0, sticky="ew", padx=(0, 10))
+        self.progress_bar = ttk.Progressbar(self.progress_frame, mode="indeterminate", maximum=100, length=280)
+        self.progress_bar.grid(row=0, column=1, sticky="ew")
+        ttk.Label(self.progress_frame, textvariable=self.progress_percent, width=8, anchor="e").grid(row=0, column=2, sticky="e", padx=(8, 0))
+        self.progress_frame.columnconfigure(0, weight=3)
+        self.progress_frame.columnconfigure(1, weight=2)
+        self.progress_frame.grid_remove()
 
         self.issue_frame = ttk.LabelFrame(outer, text="2 · SCRs and Git updates", style="Section.TLabelframe", padding=8)
         self.issue_frame.pack(fill="x", pady=(10, 0))
-        self.repo_details = tk.StringVar(value="Load a repository to see its branches, SCR keys, and recent commits.")
+        self.repo_details = tk.StringVar(value="Load a repository to discover SCRs. Selecting Analyze will match the SCR to Git changes automatically.")
         ttk.Label(self.issue_frame, textvariable=self.repo_details).pack(anchor="w", pady=(0, 6))
         split = ttk.Panedwindow(self.issue_frame, orient="horizontal")
         split.pack(fill="x", expand=True)
@@ -246,7 +360,7 @@ class DesktopApp:
         self.issue_list.configure(yscrollcommand=issue_scroll.set)
         self.issue_list.bind("<<ListboxSelect>>", self._on_issue_list_selection)
         self.issue_list.bind("<Double-Button-1>", lambda _event: self._inspect_selected())
-        self.inspect_button = ttk.Button(scr_panel, text="Continue with selected SCR", command=self._inspect_selected, state="disabled")
+        self.inspect_button = ttk.Button(scr_panel, text="Analyze selected SCR", command=self._inspect_selected, state="disabled")
         self.inspect_button.pack(fill="x", pady=(5, 0))
         self.manual_frame = ttk.Frame(scr_panel)
         ttk.Label(self.manual_frame, text="No SCR key found in Git; optional manual fallback:").pack(anchor="w")
@@ -266,7 +380,7 @@ class DesktopApp:
         update_scroll.pack(side="right", fill="y")
         self.update_list.configure(yscrollcommand=update_scroll.set)
 
-        refs = ttk.LabelFrame(outer, text="3 · Choose the Git change range", style="Section.TLabelframe", padding=10)
+        refs = ttk.LabelFrame(outer, text="Optional · Advanced manual range fallback", style="Section.TLabelframe", padding=10)
         refs.pack(fill="x", pady=(10, 0))
         self.refs_frame = refs
         ttk.Label(refs, text="Base (before change)").grid(row=0, column=0, sticky="w")
@@ -282,10 +396,15 @@ class DesktopApp:
         ttk.Button(config_row, text="Browse…", command=self._browse_config).pack(side="left", padx=(6, 0))
         self.analyze_button = ttk.Button(refs, text="Analyze selected range", style="Primary.TButton", command=self._analyze, state="disabled")
         self.analyze_button.grid(row=3, column=1, sticky="e", padx=(8, 0))
+        self.range_notice = tk.StringVar(value="")
+        ttk.Label(refs, textvariable=self.range_notice, wraplength=980, foreground="#8a5410").grid(
+            row=4, column=0, columnspan=2, sticky="w", pady=(8, 0)
+        )
         refs.columnconfigure(0, weight=1)
         refs.columnconfigure(1, weight=1)
+        refs.pack_forget()
 
-        results = ttk.LabelFrame(outer, text="4 · Impact report", style="Section.TLabelframe", padding=8)
+        results = ttk.LabelFrame(outer, text="3 · Impact report", style="Section.TLabelframe", padding=8)
         results.pack(fill="both", expand=True, pady=(10, 0))
         self.results_frame = results
         self.notebook = ttk.Notebook(results)
@@ -439,14 +558,27 @@ class DesktopApp:
         self.canvas.yview_moveto(min(1.0, target_y / page_height))
 
     def _on_issue_list_selection(self, _event: Any = None) -> None:
-        if self.mode.get() != "git" or not self.repo_session:
+        if self._busy:
             return
         selection = self.issue_list.curselection()
         if not selection:
             return
         issue = self.issues[selection[0]]
         self.selected_issue = issue
-        self._show_issue_refs(self.repo_session, issue)
+        self.refs_frame.pack_forget()
+        self.inspect_button.configure(text="Analyze selected SCR", state="normal")
+        if self.mode.get() == "git":
+            if not self.repo_session:
+                return
+            matches = self.repo_session.get("issue_matches", {}).get(issue["key"].upper(), {"branches": [], "commits": []})
+            if matches["branches"] or matches["commits"]:
+                self.status.set(f"{issue['key']} matches Git history. Automatically selecting its change range and starting CC/DC analysis…")
+            else:
+                self.status.set(f"No exact Git reference for {issue['key']}; attempting safe automatic matching before offering a manual fallback…")
+            self._start_selected_analysis(issue)
+        else:
+            self.status.set(f"Loading repository and automatically analyzing selected Jira SCR {issue['key']}…")
+            self._start_repo_inspection(self.repo_value.get().strip(), issue)
 
     def _toggle_mode(self) -> None:
         if self.mode.get() == "git":
@@ -520,26 +652,32 @@ class DesktopApp:
             self.issue_list.insert(tk.END, f"{issue.get('key', '')}  ·  {summary}  ·  {updated}")
 
     def _show_issues(self, issues: list[dict[str, Any]]) -> None:
+        self.selected_issue = None
         self._fill_issue_list(issues)
         self._show_updates([])
         self.manual_frame.pack_forget()
-        self.repo_details.set(f"Jira returned {len(issues)} issue(s). Repository updates will load after you select an SCR.")
-        self.inspect_button.configure(text="Inspect selected SCR", state="normal" if issues else "disabled")
-        self.status.set(f"Loaded {len(issues)} Jira issue(s). Select one, then inspect its Git refs.")
+        self.repo_details.set(f"Jira returned {len(issues)} issue(s). Selecting an SCR loads its repository and starts analysis automatically.")
+        self.inspect_button.configure(text="Analyze selected SCR", state="normal" if issues else "disabled")
+        self.refs_frame.pack_forget()
+        self.status.set(f"Loaded {len(issues)} Jira issue(s). Select an SCR to automatically load its repository, infer the range, and run CC/DC analysis.")
         self._scroll_to(self.issue_frame)
         if not issues:
             messagebox.showinfo("No issues found", "No recent Jira issues matched the selected project and date range.", parent=self.root)
 
     def _inspect_selected(self) -> None:
         selection = self.issue_list.curselection()
-        if not selection:
-            messagebox.showinfo("Select an SCR", "Choose an SCR from the list first.", parent=self.root)
+        if selection:
+            issue = self.issues[selection[0]]
+        else:
+            issue = self.selected_issue
+        if not issue:
+            messagebox.showinfo("Select an SCR", "Choose an SCR from the list or enter a manual SCR key first.", parent=self.root)
             return
-        issue = self.issues[selection[0]]
+        self.selected_issue = issue
+        self.refs_frame.pack_forget()
         if self.mode.get() == "git":
-            self.selected_issue = issue
             if self.repo_session:
-                self._show_issue_refs(self.repo_session, issue)
+                self._start_selected_analysis(issue)
             return
         self._start_repo_inspection(self.repo_value.get().strip(), issue)
 
@@ -547,9 +685,10 @@ class DesktopApp:
         self.selected_issue = None
         self.analyze_button.configure(state="disabled")
         self._run_async(
-            lambda: self._inspect_repo(repo_value),
+            lambda: self._inspect_repo(repo_value, self._report_progress),
             self._show_git_repository,
             "Cloning/fetching repository and scanning branches + recent commits…",
+            completion_text="Repository scan complete · refs, commits, and SCR keys are loaded.",
         )
 
     def _start_repo_inspection(self, repo_value: str, issue: dict[str, Any]) -> None:
@@ -559,39 +698,70 @@ class DesktopApp:
         self.selected_issue = issue
         if self.repo_session and self.repo_session.get("repo_label") == repo_value:
             self._render_repository_details(self.repo_session)
-            self._show_issue_refs(self.repo_session, issue)
+            self._start_selected_analysis(issue)
             return
         self.analyze_button.configure(state="disabled")
         self._run_async(
-            lambda: self._inspect_repo(repo_value),
+            lambda: self._inspect_repo(repo_value, self._report_progress),
             lambda session: self._show_jira_repository(session, issue),
             f"Loading repository details for {issue['key']}…",
+            completion_text=f"Repository details ready for {issue['key']}.",
         )
 
     @staticmethod
-    def _inspect_repo(repo_value: str) -> dict[str, Any]:
+    def _inspect_repo(repo_value: str, progress: ProgressCallback | None = None) -> dict[str, Any]:
+        def report(value: float | None, message: str) -> None:
+            if progress:
+                progress(value, message)
+
         tempdir = tempfile.TemporaryDirectory(prefix="ccdc-desktop-")
         repo = Path(tempdir.name) / "repo"
         try:
+            report(None, "Cloning/fetching the repository and receiving Git objects…")
             _clone_repo(repo_value, repo)
+            report(52, "Repository data received. Enumerating local and remote refs…")
             refs = sorted({
                 ref for ref in _git(["for-each-ref", "--format=%(refname:short)", "refs/remotes/origin", "refs/heads"], repo, check=False).splitlines()
                 if ref and not ref.endswith("/HEAD")
             })
+            report(57, f"Found {len(refs)} refs. Reading up to 5,000 recent commit subjects…")
+            report(None, "Git is collecting recent commit metadata…")
             raw_log = _git(
                 ["log", "--all", "--max-count=5000", "--date=short", "--format=%H%x09%ad%x09%s"],
                 repo,
                 check=False,
             )
+            log_lines = raw_log.splitlines()
+            total_lines = len(log_lines)
             commits = []
-            for line in raw_log.splitlines():
+            update_every = max(1, total_lines // 35)
+            for index, line in enumerate(log_lines, start=1):
                 parts = line.split("\t", 2)
                 if len(parts) == 3:
                     commits.append({"ref": parts[0], "short": parts[0][:10], "date": parts[1], "subject": parts[2]})
+                if total_lines and (index == total_lines or index % update_every == 0):
+                    percent = 59 + 15 * index / total_lines
+                    report(percent, f"Reading commit list: {index}/{total_lines} entries")
+
+            if total_lines:
+                report(74, f"Checking {len(commits)} commit subjects and {len(refs)} refs for SCR keys…")
+                issues, issue_matches = discover_git_issues(
+                    refs,
+                    commits,
+                    progress=lambda done, total: report(
+                        74 + 17 * done / max(1, total),
+                        f"Scanning commit messages for SCR keys: {done}/{total}",
+                    ),
+                )
+            else:
+                report(91, "No commits to scan; checking branch names for SCR keys…")
+                issues, issue_matches = discover_git_issues(refs, commits)
             if not refs and not commits:
                 raise RuntimeError("Git clone completed, but the repository has no branches or commits to inspect. Verify that this is a non-empty Git repository.")
-            issues, issue_matches = discover_git_issues(refs, commits)
             latest = commits[0] if commits else {"subject": "No commits found", "date": ""}
+            report(96, "Selecting the default base ref and preparing repository details…")
+            default_base = _default_base(repo)
+            report(99, f"Preparing the recent-update list ({min(100, len(commits))} displayed commits)…")
             return {
                 "tempdir": tempdir,
                 "path": repo,
@@ -601,7 +771,7 @@ class DesktopApp:
                 "recent_commits": commits[:100],
                 "discovered_issues": issues,
                 "issue_matches": issue_matches,
-                "default_base": _default_base(repo),
+                "default_base": default_base,
                 "latest_commit": latest,
             }
         except Exception:
@@ -635,10 +805,11 @@ class DesktopApp:
         self._replace_repository_session(session)
         issues = session["discovered_issues"]
         self._fill_issue_list(issues)
-        self.inspect_button.configure(text="Inspect selected SCR", state="normal" if issues else "disabled")
+        self.inspect_button.configure(text="Analyze selected SCR", state="normal" if issues else "disabled")
+        self.refs_frame.pack_forget()
         if issues:
             self.manual_frame.pack_forget()
-            self.status.set(f"Found {len(issues)} SCR key(s) in repository history. Select one to inspect matching refs.")
+            self.status.set(f"Found {len(issues)} SCR key(s). Select an SCR to infer its Git range and start CC/DC analysis automatically; the button can re-run it.")
         else:
             self.manual_frame.pack(fill="x", pady=(6, 0))
             self.status.set("Repository loaded, but no SCR-like key was found in its branches or recent commit messages.")
@@ -647,9 +818,10 @@ class DesktopApp:
     def _show_jira_repository(self, session: dict[str, Any], issue: dict[str, Any]) -> None:
         self._replace_repository_session(session)
         self.selected_issue = issue
-        self._show_issue_refs(session, issue)
+        self.inspect_button.configure(state="disabled")
+        self.root.after(80, self._start_selected_analysis, issue)
 
-    def _show_issue_refs(self, session: dict[str, Any], issue: dict[str, Any]) -> None:
+    def _show_issue_refs(self, session: dict[str, Any], issue: dict[str, Any], reason: str) -> None:
         matches = session["issue_matches"].get(issue["key"].upper(), {"branches": [], "commits": []})
         branches = matches["branches"]
         commits = matches["commits"]
@@ -661,13 +833,11 @@ class DesktopApp:
         self.head_combo.configure(values=head_choices)
         self.base_ref.set(session["default_base"])
         self.head_ref.set(branches[0] if branches else (commit_refs[0] if commit_refs else "HEAD"))
-        if branches or commits:
-            self.status.set(
-                f"{issue['key']}: found {len(branches)} matching branch(es) and {len(commits)} commit(s). Verify refs before analysis."
-            )
-        else:
-            self.status.set(f"No branch or commit mentions {issue['key']}; choose the SCR range from the Git updates list.")
-        self.analyze_button.configure(state="normal")
+        self.range_notice.set(f"{reason} Set a base and head only if you know which Git change belongs to this SCR.")
+        self.refs_frame.pack(fill="x", pady=(10, 0), before=self.results_frame)
+        self.analyze_button.configure(text="Analyze this manual range", state="normal")
+        self.inspect_button.configure(state="disabled")
+        self.status.set(f"Automatic range matching could not safely identify {issue['key']}; the optional manual fallback is shown below.")
         self._scroll_to(self.refs_frame)
 
     def _use_manual_key(self) -> None:
@@ -679,11 +849,15 @@ class DesktopApp:
             return
         issue = {"key": key, "summary": "Manually identified SCR", "updated": "Git only", "status": "Jira not queried", "url": None}
         self.selected_issue = issue
-        self._show_issue_refs(self.repo_session, issue)
+        self.refs_frame.pack_forget()
+        self.inspect_button.configure(text="Analyze selected SCR", state="normal")
+        self.status.set(f"{key} selected. Automatically matching its Git changes and starting CC/DC analysis…")
+        self._start_selected_analysis(issue)
 
     def _analyze(self) -> None:
+        """Run the optional manual range override."""
         if not self.repo_session or not self.selected_issue:
-            messagebox.showerror("Inspect a repository first", "Choose an SCR and inspect the Git repository before analysis.", parent=self.root)
+            messagebox.showerror("SCR required", "Select an SCR before analyzing.", parent=self.root)
             return
         base_ref = self.base_ref.get().strip()
         head_ref = self.head_ref.get().strip()
@@ -692,24 +866,94 @@ class DesktopApp:
             return
         config_value = self.config_path.get().strip()
         config_path = Path(config_value).expanduser() if config_value else None
+        session, issue = self.repo_session, self.selected_issue
+        self.analyze_button.configure(state="disabled")
+        self._run_async(
+            lambda: self._analysis_work(session, issue, base_ref, head_ref, config_path),
+            self._show_report,
+            f"Analyzing {issue['key']} · {base_ref} → {head_ref}…",
+            completion_text="Manual-range analysis complete · report and rendered Mermaid diagram are ready.",
+        )
+
+    def _start_selected_analysis(self, issue: dict[str, Any]) -> None:
+        """Resolve the selected SCR to Git refs, then run analysis without asking for a range."""
+        if self._busy:
+            return
+        if not self.repo_session:
+            self._start_repo_inspection(self.repo_value.get().strip(), issue)
+            return
         session = self.repo_session
-        issue = self.selected_issue
-        output_dir = Path.cwd() / "ccdc-reports" / issue["key"]
+        self.selected_issue = issue
+        self.refs_frame.pack_forget()
+        config_value = self.config_path.get().strip()
+        config_path = Path(config_value).expanduser() if config_value else None
 
         def run() -> dict[str, Any]:
-            if not _git(["rev-parse", "--verify", base_ref], session["path"], check=False):
-                raise RuntimeError(f"Git base ref was not found: {base_ref}")
-            if not _git(["rev-parse", "--verify", head_ref], session["path"], check=False):
-                raise RuntimeError(f"Git head ref was not found: {head_ref}")
-            if not _git(["merge-base", base_ref, head_ref], session["path"], check=False):
-                raise RuntimeError("Base and head refs have no common ancestor.")
-            paths = analyze_change(session["path"], base_ref, head_ref, issue, output_dir, config_path, repo_label=session["repo_label"])
-            contents = {key: paths[key].read_text(encoding="utf-8") for key in ("markdown", "diff", "mermaid", "json")}
-            report = json.loads(contents["json"])
-            return {"paths": paths, "contents": contents, "report": report}
+            mapping, reason = resolve_scr_range(session, issue, self._report_progress)
+            if mapping is None:
+                return {"manual_range_required": True, "reason": reason}
+            self._report_progress(None, f"Matched {issue['key']} to {mapping['strategy']}; starting CC/DC analysis…")
+            analysis = self._analysis_work(
+                session, issue, mapping["base_ref"], mapping["head_ref"], config_path
+            )
+            return {"manual_range_required": False, "mapping": mapping, "analysis": analysis}
 
-        self.analyze_button.configure(state="disabled")
-        self._run_async(run, self._show_report, f"Analyzing {issue['key']} · {base_ref} → {head_ref}…")
+        def finish(payload: dict[str, Any]) -> None:
+            if payload["manual_range_required"]:
+                self._show_issue_refs(session, issue, payload["reason"])
+                return
+            mapping = payload["mapping"]
+            self.base_ref.set(mapping["base_ref"])
+            self.head_ref.set(mapping["head_ref"])
+            self._show_report(payload["analysis"])
+            self.status.set(
+                f"Analysis complete · auto-matched {issue['key']} via {mapping['strategy']}: "
+                f"{mapping['base_ref']} → {mapping['head_ref']}"
+            )
+
+        self._run_async(
+            run,
+            finish,
+            f"Matching {issue['key']} to Git changes and running CC/DC analysis…",
+            completion_text=lambda payload: (
+                f"No safe automatic range for {issue['key']} · choose the optional manual range below."
+                if payload["manual_range_required"]
+                else f"Analysis complete · {issue['key']} report and Mermaid diagram are ready."
+            ),
+        )
+
+    def _analysis_work(
+        self,
+        session: dict[str, Any],
+        issue: dict[str, Any],
+        base_ref: str,
+        head_ref: str,
+        config_path: Path | None,
+    ) -> dict[str, Any]:
+        self._report_progress(None, f"Verifying base ref {base_ref}…")
+        if not _git(["rev-parse", "--verify", base_ref], session["path"], check=False):
+            raise RuntimeError(f"Git base ref was not found: {base_ref}")
+        self._report_progress(None, f"Base ref verified. Checking head ref {head_ref}…")
+        if not _git(["rev-parse", "--verify", head_ref], session["path"], check=False):
+            raise RuntimeError(f"Git head ref was not found: {head_ref}")
+        self._report_progress(None, "Both refs exist. Checking their common ancestor…")
+        if not _git(["merge-base", base_ref, head_ref], session["path"], check=False):
+            raise RuntimeError("Base and head refs have no common ancestor.")
+        self._report_progress(None, "Refs are ready. Beginning C/C++ impact analysis…")
+        output_dir = Path.cwd() / "ccdc-reports" / issue["key"]
+        paths = analyze_change(
+            session["path"], base_ref, head_ref, issue, output_dir, config_path,
+            repo_label=session["repo_label"], progress=self._report_progress,
+        )
+        self._report_progress(99, "Loading Markdown, JSON, source diff, and Mermaid source into the report tabs…")
+        contents = {key: paths[key].read_text(encoding="utf-8") for key in ("markdown", "diff", "mermaid", "json")}
+        report = json.loads(contents["json"])
+        self._report_progress(None, "Decoding the generated Mermaid PNG for the diagram tab…")
+        from PIL import Image
+
+        with Image.open(paths["mermaid_png"]) as source_image:
+            flow_image = source_image.convert("RGB")
+        return {"paths": paths, "contents": contents, "report": report, "flow_image": flow_image}
 
     @staticmethod
     def _replace_text(widget: tk.Text, content: str) -> None:
@@ -794,7 +1038,14 @@ class DesktopApp:
         if self.flow_report is not None and self.flow_png_path is not None:
             self._draw_flow(self.flow_report, zoom=self.flow_zoom * factor)
 
-    def _draw_flow(self, report: dict[str, Any], image_path: Path | None = None, fit: bool = False, zoom: float | None = None) -> None:
+    def _draw_flow(
+        self,
+        report: dict[str, Any],
+        image_path: Path | None = None,
+        image: Any = None,
+        fit: bool = False,
+        zoom: float | None = None,
+    ) -> None:
         from PIL import Image, ImageTk
 
         self.flow_report = report
@@ -809,7 +1060,9 @@ class DesktopApp:
             self.flow_status.set(message)
             return
 
-        if self.flow_image_original is None or image_path is not None:
+        if image is not None:
+            self.flow_image_original = image
+        elif self.flow_image_original is None or image_path is not None:
             with Image.open(self.flow_png_path) as source:
                 self.flow_image_original = source.convert("RGB")
         original = self.flow_image_original
@@ -840,7 +1093,7 @@ class DesktopApp:
         report_edges = report.get("edges", [])
         self.flow_status.set(
             f"Rendered from impact-flow.mmd by Mermaid.js · {original.width} × {original.height}px · "
-            f"{len(report_edges)} call/coupling edges · Fit or +/− to resize; scroll to inspect details."
+            f"{len(report_edges)} analyzed edges. Large graphs are summarized; Edge Details / JSON retain all findings. Use Fit or +/− to resize."
         )
 
     def _show_report(self, result: dict[str, Any]) -> None:
@@ -858,7 +1111,7 @@ class DesktopApp:
         self._populate_edge_table(report)
         self.notebook.select(1)
         self.root.update_idletasks()
-        self._draw_flow(report, image_path=self.report_paths.get("mermaid_png"), fit=True)
+        self._draw_flow(report, image_path=self.report_paths.get("mermaid_png"), image=result.get("flow_image"), fit=True)
         self.open_report_button.configure(state="normal")
         self.analyze_button.configure(state="normal")
         self.status.set(f"Analysis complete · report saved to {self.report_paths['markdown']}")
@@ -883,14 +1136,86 @@ class DesktopApp:
         except OSError as exc:
             messagebox.showerror("Could not open report", str(exc), parent=self.root)
 
-    def _run_async(self, work: Callable[[], Any], on_success: Callable[[Any], None], busy_text: str) -> None:
+    def _report_progress(self, percent: float | None, message: str) -> None:
+        """Queue worker progress on Tk's main thread; None means work is not countable yet."""
+        try:
+            self.root.after(0, self._set_progress, percent, message)
+        except tk.TclError:
+            pass
+
+    def _set_progress(self, percent: float | None, message: str) -> None:
+        if not self.progress_frame.winfo_manager():
+            self.progress_frame.grid()
+        self.progress_detail.set(message)
+        if percent is None:
+            if self.progress_bar.cget("mode") != "indeterminate":
+                self.progress_bar.stop()
+                self._progress_animation_running = False
+                self.progress_bar.configure(mode="indeterminate")
+            if not self._progress_animation_running:
+                self.progress_bar.start(12)
+                self._progress_animation_running = True
+            self.progress_percent.set("Working")
+            return
+
+        if self._progress_animation_running:
+            self.progress_bar.stop()
+            self._progress_animation_running = False
+        if self.progress_bar.cget("mode") != "determinate":
+            self.progress_bar.configure(mode="determinate")
+        bounded = max(0.0, min(100.0, percent))
+        self.progress_bar.configure(value=bounded)
+        self.progress_percent.set(f"{bounded:.0f}%")
+
+    def _begin_progress(self, message: str) -> None:
+        if self._progress_reset_id is not None:
+            try:
+                self.root.after_cancel(self._progress_reset_id)
+            except tk.TclError:
+                pass
+            self._progress_reset_id = None
+        self.progress_frame.grid()
+        self.progress_bar.stop()
+        self._progress_animation_running = False
+        self.progress_bar.configure(mode="indeterminate", value=0)
+        self.progress_detail.set(message)
+        self.progress_percent.set("Working")
+        self.progress_bar.start(12)
+        self._progress_animation_running = True
+
+    def _complete_progress(self, message: str) -> None:
+        if self._progress_animation_running:
+            self.progress_bar.stop()
+            self._progress_animation_running = False
+        self.progress_bar.configure(mode="determinate", value=100)
+        self.progress_percent.set("100%")
+        self.progress_detail.set(message)
+        self._progress_reset_id = self.root.after(4000, self._hide_progress)
+
+    def _hide_progress(self) -> None:
+        self._progress_reset_id = None
+        if not self._busy:
+            self.progress_frame.grid_remove()
+            self.progress_bar.configure(value=0)
+            self.progress_detail.set("")
+            self.progress_percent.set("")
+
+    def _run_async(
+        self,
+        work: Callable[[], Any],
+        on_success: Callable[[Any], None],
+        busy_text: str,
+        completion_text: str | Callable[[Any], str] = "Operation complete.",
+    ) -> None:
         if self._busy:
             return
         self._busy = True
         self.status.set(busy_text)
+        self._begin_progress(busy_text)
         self.load_button.configure(state="disabled")
         self.inspect_button.configure(state="disabled")
         self.analyze_button.configure(state="disabled")
+        self.issue_list.configure(state="disabled")
         self.root.configure(cursor="watch")
 
         def run() -> None:
@@ -899,24 +1224,38 @@ class DesktopApp:
             except Exception as exc:
                 self.root.after(0, self._finish_error, str(exc))
             else:
-                self.root.after(0, self._finish_success, on_success, result)
+                self.root.after(0, self._finish_success, on_success, result, completion_text)
 
         self.executor.submit(run)
 
-    def _finish_success(self, callback: Callable[[Any], None], result: Any) -> None:
+    def _finish_success(
+        self,
+        callback: Callable[[Any], None],
+        result: Any,
+        completion_text: str | Callable[[Any], str],
+    ) -> None:
         self._busy = False
         self.root.configure(cursor="")
         self.load_button.configure(state="normal")
-        if self.mode.get() == "jira" and self.issues:
-            self.inspect_button.configure(state="normal")
+        self.issue_list.configure(state="normal")
+        self.inspect_button.configure(state="normal" if self.selected_issue else "disabled")
         callback(result)
+        message = completion_text(result) if callable(completion_text) else completion_text
+        self._complete_progress(message)
 
     def _finish_error(self, message: str) -> None:
         self._busy = False
         self.root.configure(cursor="")
         self.load_button.configure(state="normal")
-        self.inspect_button.configure(state="normal" if self.mode.get() == "jira" and self.issues else "disabled")
+        self.issue_list.configure(state="normal")
+        self.inspect_button.configure(state="normal" if self.selected_issue or (self.mode.get() == "jira" and self.issues) else "disabled")
         self.analyze_button.configure(state="normal" if self.repo_session else "disabled")
+        if self._progress_animation_running:
+            self.progress_bar.stop()
+            self._progress_animation_running = False
+        self.progress_bar.configure(mode="determinate")
+        self.progress_detail.set("Operation failed · see error details")
+        self.progress_percent.set("Error")
         self.status.set("Operation failed · see error details")
         messagebox.showerror("CC/DC operation failed", message, parent=self.root)
 
