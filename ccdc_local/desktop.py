@@ -98,8 +98,21 @@ class DesktopApp:
         style.configure("Section.TLabelframe.Label", font=("Segoe UI", 10, "bold"))
         style.configure("Primary.TButton", font=("Segoe UI", 10, "bold"), padding=(12, 7))
 
-        outer = ttk.Frame(self.root, padding=(18, 14))
-        outer.pack(fill="both", expand=True)
+        shell = ttk.Frame(self.root)
+        shell.pack(fill="both", expand=True)
+        self.canvas = tk.Canvas(shell, highlightthickness=0, borderwidth=0)
+        page_scroll = ttk.Scrollbar(shell, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=page_scroll.set)
+        page_scroll.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        outer = ttk.Frame(self.canvas, padding=(18, 14))
+        self.outer = outer
+        self.canvas_window = self.canvas.create_window((0, 0), window=outer, anchor="nw")
+        outer.bind("<Configure>", self._update_scrollregion)
+        self.canvas.bind("<Configure>", self._resize_scrollable_page)
+        self.root.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.root.bind_all("<Button-4>", self._on_mousewheel)
+        self.root.bind_all("<Button-5>", self._on_mousewheel)
         header = ttk.Frame(outer)
         header.pack(fill="x", pady=(0, 12))
         ttk.Label(header, text="CC/DC Local Workbench", style="Header.TLabel").pack(anchor="w")
@@ -187,7 +200,9 @@ class DesktopApp:
         issue_scroll = ttk.Scrollbar(issue_list_frame, orient="vertical", command=self.issue_list.yview)
         issue_scroll.pack(side="right", fill="y")
         self.issue_list.configure(yscrollcommand=issue_scroll.set)
-        self.inspect_button = ttk.Button(scr_panel, text="Inspect selected SCR", command=self._inspect_selected, state="disabled")
+        self.issue_list.bind("<<ListboxSelect>>", self._on_issue_list_selection)
+        self.issue_list.bind("<Double-Button-1>", lambda _event: self._inspect_selected())
+        self.inspect_button = ttk.Button(scr_panel, text="Continue with selected SCR", command=self._inspect_selected, state="disabled")
         self.inspect_button.pack(fill="x", pady=(5, 0))
         self.manual_frame = ttk.Frame(scr_panel)
         ttk.Label(self.manual_frame, text="No SCR key found in Git; optional manual fallback:").pack(anchor="w")
@@ -228,6 +243,7 @@ class DesktopApp:
 
         results = ttk.LabelFrame(outer, text="4 · Impact report", style="Section.TLabelframe", padding=8)
         results.pack(fill="both", expand=True, pady=(10, 0))
+        self.results_frame = results
         self.notebook = ttk.Notebook(results)
         self.notebook.pack(fill="both", expand=True)
         self.result_text: dict[str, tk.Text] = {}
@@ -249,6 +265,40 @@ class DesktopApp:
         self.open_report_button = ttk.Button(result_actions, text="Open report file", command=self._open_report, state="disabled")
         self.open_report_button.pack(side="left")
         ttk.Label(result_actions, text="Reports are saved under ccdc-reports/<SCR-KEY>/").pack(side="left", padx=(10, 0))
+
+    def _update_scrollregion(self, _event: Any = None) -> None:
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _resize_scrollable_page(self, event: tk.Event) -> None:
+        self.canvas.itemconfigure(self.canvas_window, width=event.width)
+
+    def _on_mousewheel(self, event: tk.Event) -> str | None:
+        widget = event.widget
+        if isinstance(widget, (tk.Listbox, tk.Text, ttk.Treeview, ttk.Combobox)):
+            return None
+        if getattr(event, "num", None) == 4:
+            self.canvas.yview_scroll(-1, "units")
+        elif getattr(event, "num", None) == 5:
+            self.canvas.yview_scroll(1, "units")
+        elif getattr(event, "delta", 0):
+            self.canvas.yview_scroll(int(-event.delta / 120) or (-1 if event.delta > 0 else 1), "units")
+        return "break"
+
+    def _scroll_to(self, widget: tk.Widget) -> None:
+        self.root.update_idletasks()
+        page_height = max(1, self.outer.winfo_height())
+        target_y = max(0, widget.winfo_rooty() - self.outer.winfo_rooty())
+        self.canvas.yview_moveto(min(1.0, target_y / page_height))
+
+    def _on_issue_list_selection(self, _event: Any = None) -> None:
+        if self.mode.get() != "git" or not self.repo_session:
+            return
+        selection = self.issue_list.curselection()
+        if not selection:
+            return
+        issue = self.issues[selection[0]]
+        self.selected_issue = issue
+        self._show_issue_refs(self.repo_session, issue)
 
     def _toggle_mode(self) -> None:
         if self.mode.get() == "git":
@@ -328,6 +378,7 @@ class DesktopApp:
         self.repo_details.set(f"Jira returned {len(issues)} issue(s). Repository updates will load after you select an SCR.")
         self.inspect_button.configure(text="Inspect selected SCR", state="normal" if issues else "disabled")
         self.status.set(f"Loaded {len(issues)} Jira issue(s). Select one, then inspect its Git refs.")
+        self._scroll_to(self.issue_frame)
         if not issues:
             messagebox.showinfo("No issues found", "No recent Jira issues matched the selected project and date range.", parent=self.root)
 
@@ -443,6 +494,7 @@ class DesktopApp:
         else:
             self.manual_frame.pack(fill="x", pady=(6, 0))
             self.status.set("Repository loaded, but no SCR-like key was found in its branches or recent commit messages.")
+        self._scroll_to(self.issue_frame)
 
     def _show_jira_repository(self, session: dict[str, Any], issue: dict[str, Any]) -> None:
         self._replace_repository_session(session)
@@ -468,6 +520,7 @@ class DesktopApp:
         else:
             self.status.set(f"No branch or commit mentions {issue['key']}; choose the SCR range from the Git updates list.")
         self.analyze_button.configure(state="normal")
+        self._scroll_to(self.refs_frame)
 
     def _use_manual_key(self) -> None:
         if not self.repo_session:
@@ -526,6 +579,7 @@ class DesktopApp:
         if self.repo_session:
             self.repo_session["tempdir"].cleanup()
             self.repo_session = None
+        self._scroll_to(self.results_frame)
 
     def _open_report(self) -> None:
         path = self.report_paths.get("markdown")
