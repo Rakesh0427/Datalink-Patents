@@ -1,0 +1,16 @@
+{
+  "components": {
+    "Sensor": ["src/sensor"],
+    "Control": ["src/control"],
+    "Actuator": ["src/actuator"]
+  },
+  "requirements": {
+    "REQ-TEMP-014": ["src/sensor/sensor.c::convert_temperature#1"],
+    "REQ-VALVE-022": ["src/control/controller.cpp::update_valve#2"]
+  },
+  "tests": {
+    "TC-TEMP-LOW": ["REQ-TEMP-014", "REQ-VALVE-022"],
+    "TC-TEMP-LIMIT": ["REQ-TEMP-014", "REQ-VALVE-022"],
+    "TC-TEMP-HIGH": ["REQ-TEMP-014", "REQ-VALVE-022"]
+  }
+}

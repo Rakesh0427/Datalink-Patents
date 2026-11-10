@@ -1,0 +1,66 @@
+name: Coupling Guard
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  cc-dc-impact:
+    name: CC/DC impact analysis (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out pull request (including base history)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install analyzer and language parsers
+        shell: bash
+        run: python -m pip install -e .
+
+      - name: Analyze changed code
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        shell: bash
+        run: >-
+          python -m coupling_guard analyze
+          --root .
+          --config coupling.json
+          --base-ref "$BASE_SHA"
+          --head-ref "$HEAD_SHA"
+          --out reports
+          --fail-on-unresolved
+
+      - name: Run regression tests
+        shell: bash
+        run: python -m unittest discover -v
+
+      - name: Add impact report to pull request check summary
+        if: always()
+        shell: bash
+        run: |
+          if [ -f reports/coupling-report.md ]; then
+            cat reports/coupling-report.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Save diagrams and machine-readable report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coupling-guard-report-${{ runner.os }}
+          path: reports/
+          if-no-files-found: ignore
+          retention-days: 30

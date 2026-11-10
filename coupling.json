@@ -1,0 +1,23 @@
+{
+  "include": ["demo_project"],
+  "components": {
+    "Sensor": ["demo_project/sensor.py"],
+    "Controller": ["demo_project/controller.py"],
+    "Actuator": ["demo_project/actuator.py"],
+    "Application": ["demo_project/app.py"]
+  },
+  "requirements": {
+    "REQ-TEMP-014": [
+      "demo_project.sensor.convert_temperature"
+    ],
+    "REQ-VALVE-022": [
+      "demo_project.controller.update_valve",
+      "demo_project.actuator.actuator_open"
+    ]
+  },
+  "tests": {
+    "TC-TEMP-LOW": ["REQ-TEMP-014", "REQ-VALVE-022"],
+    "TC-TEMP-LIMIT": ["REQ-TEMP-014", "REQ-VALVE-022"],
+    "TC-TEMP-HIGH": ["REQ-TEMP-014", "REQ-VALVE-022"]
+  }
+}
