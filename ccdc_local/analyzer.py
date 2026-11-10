@@ -552,15 +552,26 @@ def analyze_change(
     return paths
 
 
-def _render_mermaid(source: str, svg_path: Path, png_path: Path) -> None:
-    """Render the exact Mermaid source with Mermaid.js via the local mermaidx engine."""
+def _mermaid_diagram(source: str) -> Any:
+    """Create the Mermaid.js diagram with the same local rendering settings."""
     import mermaidx
 
-    diagram = mermaidx.render(
+    return mermaidx.render(
         source,
         backend="js:mermaid",
         config={"maxTextSize": MERMAID_MAX_TEXT_SIZE},
     )
+
+
+def render_mermaid_png(source: str, width: int, height: int) -> bytes:
+    """Render Mermaid source directly at the requested raster size for crisp zoom."""
+    diagram = _mermaid_diagram(source)
+    return diagram.png(width=width, height=height, background="#ffffff")
+
+
+def _render_mermaid(source: str, svg_path: Path, png_path: Path) -> None:
+    """Render the exact Mermaid source with Mermaid.js via the local mermaidx engine."""
+    diagram = _mermaid_diagram(source)
     svg = diagram.svg()
     svg_path.write_text(svg, encoding="utf-8")
     view_box = re.search(r'viewBox="([^"]+)"', svg)
@@ -681,8 +692,11 @@ def _mermaid(report: dict[str, Any]) -> str:
     omitted_functions = len(all_names) - len(selected_names)
     omitted_edges = len(edges) - len(selected_edges)
 
+    # Keep large graphs tall rather than compressing a long left-to-right chain
+    # into a very short raster; smaller diagrams retain the conventional LR flow.
+    direction = "TB" if len(selected_names) >= 16 else "LR"
     lines = [
-        "flowchart LR",
+        f"flowchart {direction}",
         f"%% Showing {len(selected_names)} of {len(all_names)} functions and {len(selected_edges)} of {len(edges)} edges.",
     ]
     ids = {name: f"N{index}" for index, name in enumerate(sorted(selected_names))}

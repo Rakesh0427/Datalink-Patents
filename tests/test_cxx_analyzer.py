@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from ccdc_local.analyzer import MAX_MERMAID_EDGES, MAX_MERMAID_FUNCTIONS, analyze_change, _mermaid
+from ccdc_local.analyzer import MAX_MERMAID_EDGES, MAX_MERMAID_FUNCTIONS, analyze_change, render_mermaid_png, _mermaid
 
 
 class CxxAnalyzerTests(unittest.TestCase):
@@ -95,6 +95,13 @@ class CxxAnalyzerTests(unittest.TestCase):
             self.assertTrue(any("parsed" in message and "/" in message for _percent, message in progress_events))
             self.assertTrue(any("baseline source blobs" in message for _percent, message in progress_events))
 
+    def test_mermaid_can_rerender_at_requested_zoom_resolution(self):
+        source = 'flowchart LR\n  A["Sensor input"] --> B["Control update"]\n'
+        png = render_mermaid_png(source, width=1440, height=244)
+        self.assertTrue(png.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertEqual(int.from_bytes(png[16:20], "big"), 1440)
+        self.assertEqual(int.from_bytes(png[20:24], "big"), 244)
+
     def test_mermaid_diagram_caps_large_graphs_and_reports_omitted_content(self):
         names = [f"src/module_{index:03}::function_{index:03}#1" for index in range(300)]
         report = {
@@ -113,6 +120,7 @@ class CxxAnalyzerTests(unittest.TestCase):
             ],
         }
         source = _mermaid(report)
+        self.assertTrue(source.startswith("flowchart TB"))
         node_lines = [line for line in source.splitlines() if line.startswith("  N") and '["' in line]
         edge_lines = [line for line in source.splitlines() if " -->|" in line]
         self.assertEqual(len(node_lines), MAX_MERMAID_FUNCTIONS)
