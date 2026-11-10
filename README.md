@@ -1,6 +1,6 @@
 # Coupling Guard (CC/DC change-impact prototype)
 
-This repository contains local prototypes for **Control Coupling (CC)**, **Data Coupling (DC)**, and change impact: `coupling-guard` analyzes configured Python source, while `ccdc-local` analyzes C/C++ changes for a selected SCR using Git. **Jira is optional**: use the SCR key in a branch/commit for Git-only analysis, or connect Jira to browse recent issues and add summary/status context. Reports include source diffs, JSON findings, and Mermaid flow diagram source; the native desktop GUI renders the analysis graph visually. Analysis runs locally; the tool fetches Jira metadata only when Jira mode is selected and clones source using the user's normal Git credentials.
+This repository contains local prototypes for **Control Coupling (CC)**, **Data Coupling (DC)**, and change impact: `coupling-guard` analyzes configured Python source, while `ccdc-local` analyzes C/C++ changes for a selected SCR using Git. **Jira is optional**: use the SCR key in a branch/commit for Git-only analysis, or connect Jira to browse recent issues and add summary/status context. The C/C++ `ccdc-local` workflow writes source diffs, JSON findings, Mermaid flow source, and Mermaid.js-rendered SVG/PNG diagrams; its native desktop GUI displays the rendered diagram. Analysis runs locally; the tool fetches Jira metadata only when Jira mode is selected and clones source using the user's normal Git credentials.
 
 > **Scope and safety:** The C/C++ prototype uses Tree-sitter syntax parsing and heuristic call resolution. It is not a compiler-semantic analyzer, does not execute target tests or collect runtime coupling coverage, does not support Ada, and is not DO-178B/C qualified. Its results are not proof of certification compliance. Review all findings and unresolved calls; DO-178 use requires project-specific verification, configuration management, tool assessment/qualification where applicable, and approval by the responsible engineering/certification team.
 
@@ -110,7 +110,7 @@ Run this from a terminal after activating the virtual environment:
 ccdc-gui
 ```
 
-This opens a native Tk desktop window on your computer. It does **not** start a web server or open a browser. In Git-only mode, enter the repository and click **Load repository updates**; the tool scans recent commits and branch names, shows detected SCR keys and recent updates, then lets you select an SCR without typing its key. Selecting an SCR takes you to the base/head refs and analysis action. Results open on a concise Overview with change/impact/CC/DC counts, affected requirements and tests, and review notes. Separate tabs provide the rendered CC/DC flow diagram (Fit and zoom controls), a tabular CC/DC edge-details view, Markdown, source diff, Mermaid source, and JSON. The native diagram is drawn from the same analysis graph; the `.mmd` tab/file remains the Mermaid text for external Mermaid-compatible viewers. Common GitHub/GitLab/Bitbucket browser URLs are normalized to repository clone URLs. Jira browsing remains optional. On Windows, Tkinter is included with the standard python.org Python installer. On Debian/Ubuntu Linux, install `python3-tk` if Tkinter is missing.
+This opens a native Tk desktop window on your computer. It does **not** start a web server or open a browser. In Git-only mode, enter the repository and click **Load repository updates**; the tool scans recent commits and branch names, shows detected SCR keys and recent updates, then lets you select an SCR without typing its key. Selecting an SCR takes you to the base/head refs and analysis action. Results open on a concise Overview with change/impact/CC/DC counts, affected requirements and tests, and review notes. Separate tabs provide the Mermaid.js-rendered CC/DC diagram (Fit and zoom controls), a tabular CC/DC edge-details view, Markdown, source diff, Mermaid source, and JSON. Analysis generates `impact-flow.mmd`, then the local Mermaid.js renderer writes `impact-flow.svg` and `impact-flow.png`; the app displays that rendered PNG. The renderer is installed as a Python dependency, so Node.js, Chromium, and a network connection are not needed at runtime. Common GitHub/GitLab/Bitbucket browser URLs are normalized to repository clone URLs. Jira browsing remains optional. On Windows, Tkinter is included with the standard python.org Python installer. On Debian/Ubuntu Linux, install `python3-tk` if Tkinter is missing.
 
 For a terminal-only workflow, run:
 
@@ -145,9 +145,10 @@ The tool clones the source into a temporary local directory, checks out the sele
 - `ccdc-report.md` — issue, changed files/functions, impact, CC/DC edges, requirements/tests, parse warnings, and limitations.
 - `ccdc-report.json` — structured findings, edge states, and selected refs.
 - `impact-flow.mmd` — Mermaid diagram source.
+- `impact-flow.svg` / `impact-flow.png` — Mermaid.js-rendered diagram (vector and raster).
 - `source-diff.patch` — source diff for the selected Git range.
 
-Open the Markdown report in an editor and `impact-flow.mmd` in a Mermaid-compatible viewer. No source is uploaded to Jira by this tool; Jira is queried for issue metadata. Git itself contacts the supplied repository host to clone/fetch as expected.
+The desktop GUI displays the rendered diagram; the `.mmd` source can also be opened in any Mermaid-compatible viewer. No source is uploaded to Jira by this tool; Jira is queried for issue metadata. Git itself contacts the supplied repository host to clone/fetch as expected.
 
 ### Windows example
 

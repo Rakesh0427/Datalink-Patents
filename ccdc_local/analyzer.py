@@ -432,13 +432,26 @@ def analyze_change(repo: Path, base_ref: str, head_ref: str, issue: dict[str, An
         "markdown": out_dir / "ccdc-report.md",
         "json": out_dir / "ccdc-report.json",
         "mermaid": out_dir / "impact-flow.mmd",
+        "mermaid_svg": out_dir / "impact-flow.svg",
+        "mermaid_png": out_dir / "impact-flow.png",
         "diff": out_dir / "source-diff.patch",
     }
     paths["json"].write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     paths["diff"].write_text(diff.stdout, encoding="utf-8")
-    paths["mermaid"].write_text(_mermaid(report), encoding="utf-8")
+    mermaid_source = _mermaid(report)
+    paths["mermaid"].write_text(mermaid_source, encoding="utf-8")
+    _render_mermaid(mermaid_source, paths["mermaid_svg"], paths["mermaid_png"])
     paths["markdown"].write_text(_markdown(report), encoding="utf-8")
     return paths
+
+
+def _render_mermaid(source: str, svg_path: Path, png_path: Path) -> None:
+    """Render the exact Mermaid source with Mermaid.js via the local mermaidx engine."""
+    import mermaidx
+
+    diagram = mermaidx.render(source, backend="js:mermaid")
+    diagram.save(str(svg_path), format="svg")
+    diagram.save(str(png_path), scale=2, background="#ffffff", format="png")
 
 
 def _markdown(report: dict[str, Any]) -> str:
@@ -501,7 +514,7 @@ def _markdown(report: dict[str, Any]) -> str:
     lines += ["", "## Parse and resolution notes"]
     notes = report["parse_warnings"] + report["unresolved_calls"]
     lines += [f"- {note}" for note in notes] or ["- No parser warnings or ambiguous calls reported."]
-    lines += ["", "## Flow diagram", "The native desktop GUI renders the call/CC/DC graph from these findings. The accompanying `impact-flow.mmd` is its Mermaid source for external Mermaid-compatible viewers.", "", "## Source diff", "See the accompanying `source-diff.patch`.", "", "## Limitations"]
+    lines += ["", "## Flow diagram", "The accompanying `impact-flow.mmd` is rendered locally by Mermaid.js into `impact-flow.svg` and `impact-flow.png`; the desktop GUI displays the rendered PNG.", "", "## Source diff", "See the accompanying `source-diff.patch`.", "", "## Limitations"]
     lines += [f"- {x}" for x in report["limitations"]]
     return "\n".join(lines) + "\n"
 
@@ -517,8 +530,13 @@ def _mermaid(report: dict[str, Any]) -> str:
         label = name.replace('"', "'")
         lines.append(f'  {node_id}["{label}"]')
     for edge in report["edges"]:
-        label = ", ".join(edge["coupling_types"]) or "call"
-        label += f", {edge['state']}"
+        kinds = []
+        if "control" in edge["coupling_types"]:
+            kinds.append("CC · Control Coupling")
+        if "data" in edge["coupling_types"]:
+            kinds.append("DC · Data Coupling")
+        label = " + ".join(kinds) or "Call"
+        label += f" · {edge['state']}"
         lines.append(f'  {ids[edge["caller"]]} -->|"{label}"| {ids[edge["callee"]]}')
     for name, node_id in ids.items():
         if name in changed:

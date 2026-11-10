@@ -329,16 +329,17 @@ class DesktopApp:
         review_frame.columnconfigure(0, weight=1)
 
         flow_page = ttk.Frame(self.notebook)
-        self.notebook.add(flow_page, text="CC/DC flow diagram")
+        self.notebook.add(flow_page, text="Rendered Mermaid flow")
         self.flow_report: dict[str, Any] | None = None
+        self.flow_png_path: Path | None = None
         self.flow_zoom = 1.0
-        self.flow_scene_size = (900, 430)
+        self.flow_photo: Any = None
+        self.flow_image_original: Any = None
         flow_legend = ttk.Frame(flow_page, padding=(8, 5))
         flow_legend.pack(fill="x")
         ttk.Label(flow_legend, text="Changed", foreground="#b4232c").pack(side="left", padx=(0, 10))
         ttk.Label(flow_legend, text="Impacted", foreground="#1f5da8").pack(side="left", padx=(0, 10))
-        ttk.Label(flow_legend, text="CC · Control Coupling", foreground="#7042a5").pack(side="left", padx=(0, 10))
-        ttk.Label(flow_legend, text="DC · Data Coupling", foreground="#167a58").pack(side="left")
+        ttk.Label(flow_legend, text="Edge labels: CC = Control Coupling · DC = Data Coupling").pack(side="left")
         flow_zoom_controls = ttk.Frame(flow_legend)
         flow_zoom_controls.pack(side="right")
         ttk.Button(flow_zoom_controls, text="Fit", command=self._fit_flow).pack(side="left", padx=2)
@@ -346,7 +347,7 @@ class DesktopApp:
         ttk.Button(flow_zoom_controls, text="+", width=3, command=lambda: self._zoom_flow(1.25)).pack(side="left", padx=2)
         self.flow_zoom_label = tk.StringVar(value="Fit")
         ttk.Label(flow_zoom_controls, textvariable=self.flow_zoom_label, width=5, anchor="center").pack(side="left", padx=(5, 0))
-        self.flow_status = tk.StringVar(value="Run an analysis to draw the call and coupling flow.")
+        self.flow_status = tk.StringVar(value="Run an analysis to render the Mermaid call and coupling flow.")
         ttk.Label(flow_page, textvariable=self.flow_status, padding=(8, 3), wraplength=1000).pack(anchor="w")
         flow_body = ttk.Frame(flow_page)
         flow_body.pack(fill="both", expand=True)
@@ -703,7 +704,7 @@ class DesktopApp:
             if not _git(["merge-base", base_ref, head_ref], session["path"], check=False):
                 raise RuntimeError("Base and head refs have no common ancestor.")
             paths = analyze_change(session["path"], base_ref, head_ref, issue, output_dir, config_path, repo_label=session["repo_label"])
-            contents = {key: path.read_text(encoding="utf-8") for key, path in paths.items()}
+            contents = {key: paths[key].read_text(encoding="utf-8") for key in ("markdown", "diff", "mermaid", "json")}
             report = json.loads(contents["json"])
             return {"paths": paths, "contents": contents, "report": report}
 
@@ -786,51 +787,32 @@ class DesktopApp:
             ))
 
     def _fit_flow(self) -> None:
-        if self.flow_report is not None:
+        if self.flow_report is not None and self.flow_png_path is not None:
             self._draw_flow(self.flow_report, fit=True)
 
     def _zoom_flow(self, factor: float) -> None:
-        if self.flow_report is not None:
+        if self.flow_report is not None and self.flow_png_path is not None:
             self._draw_flow(self.flow_report, zoom=self.flow_zoom * factor)
 
-    def _draw_flow(self, report: dict[str, Any], fit: bool = False, zoom: float | None = None) -> None:
+    def _draw_flow(self, report: dict[str, Any], image_path: Path | None = None, fit: bool = False, zoom: float | None = None) -> None:
+        from PIL import Image, ImageTk
+
         self.flow_report = report
+        if image_path is not None:
+            self.flow_png_path = image_path
         canvas = self.flow_canvas
         canvas.delete("all")
-        edges = report.get("edges", [])
-        changed = set(report.get("changed_functions", []))
-        impacted = set(report.get("impacted_functions", []))
-        nodes = set(changed) | set(impacted)
-        components: dict[str, str] = {}
-        for edge in edges:
-            caller, callee = edge.get("caller"), edge.get("callee")
-            if caller and callee:
-                nodes.update((caller, callee))
-                components[caller] = edge.get("caller_component", "")
-                components[callee] = edge.get("callee_component", "")
-        if not nodes:
-            message = (
-                "No C/C++ files changed in the selected Git range."
-                if not report.get("changed_files")
-                else "No functions or resolvable call flows were found. Review the parse and resolution notes in Overview."
-            )
-            canvas.create_text(450, 200, text=message, fill="#65748a", font=("Segoe UI", 12), width=760)
+        if self.flow_png_path is None or not self.flow_png_path.exists():
+            message = "Rendered Mermaid PNG is missing. Re-run the analysis to generate the diagram."
+            canvas.create_text(450, 200, text=message, fill="#9b2633", font=("Segoe UI", 12), width=760)
             canvas.configure(scrollregion=(0, 0, 900, 430))
             self.flow_status.set(message)
-            self.flow_zoom_label.set("Fit")
             return
 
-        layers = flow_node_layers(report)
-        columns: dict[int, list[str]] = defaultdict(list)
-        for name in sorted(nodes):
-            columns[layers.get(name, 0)].append(name)
-        ordered_layers = sorted(columns)
-        base_node_w, base_node_h = 278, 86
-        base_x_gap, base_y_gap, margin = 92, 42, 28
-        max_rows = max(len(columns[layer]) for layer in ordered_layers)
-        base_width = max(900, margin * 2 + len(ordered_layers) * base_node_w + max(0, len(ordered_layers) - 1) * base_x_gap)
-        base_height = max(430, margin * 2 + max_rows * base_node_h + max(0, max_rows - 1) * base_y_gap)
-        self.flow_scene_size = (base_width, base_height)
+        if self.flow_image_original is None or image_path is not None:
+            with Image.open(self.flow_png_path) as source:
+                self.flow_image_original = source.convert("RGB")
+        original = self.flow_image_original
         self.root.update_idletasks()
         viewport_w = self.flow_canvas.winfo_width()
         viewport_h = self.flow_canvas.winfo_height()
@@ -838,97 +820,28 @@ class DesktopApp:
             viewport_w = max(700, self.root.winfo_width() - 100)
         if viewport_h <= 2:
             viewport_h = max(280, self.root.winfo_height() - 450)
+
         if zoom is not None:
-            scale = max(0.35, min(2.5, zoom))
+            scale = max(0.15, min(4.0, zoom))
         elif fit:
-            scale = min((viewport_w - 30) / base_width, (viewport_h - 30) / base_height, 1.0)
-            scale = max(0.35, scale)
+            scale = max(0.15, min((viewport_w - 30) / original.width, (viewport_h - 30) / original.height, 1.0))
         else:
             scale = self.flow_zoom
         self.flow_zoom = scale
-        self.flow_zoom_label.set(f"{scale:.0%}")
-        node_w, node_h = base_node_w * scale, base_node_h * scale
-        x_gap, y_gap = base_x_gap * scale, base_y_gap * scale
-        width, height = base_width * scale, base_height * scale
-        canvas.configure(scrollregion=(0, 0, width, height))
-        positions: dict[str, tuple[float, float]] = {}
-        for column_index, layer in enumerate(ordered_layers):
-            for row_index, name in enumerate(columns[layer]):
-                positions[name] = (margin * scale + column_index * (node_w + x_gap), margin * scale + row_index * (node_h + y_gap))
-
-        state_colors = {"added": "#16865f", "removed": "#c23d4b", "unchanged": "#8391a3", "current": "#8391a3"}
-        line_width = max(1, 2 * scale)
-        arrowshape = (max(7, 10 * scale), max(8, 12 * scale), max(4, 5 * scale))
-        edge_font_size = max(6, int(8 * scale))
-        for edge in edges:
-            caller, callee = edge.get("caller"), edge.get("callee")
-            if caller not in positions or callee not in positions:
-                continue
-            x1, y1 = positions[caller]
-            x2, y2 = positions[callee]
-            sy, ey = y1 + node_h / 2, y2 + node_h / 2
-            if caller == callee:
-                coords = (x1 + node_w - 10 * scale, y1 + 28 * scale, x1 + node_w + 44 * scale, y1 - 16 * scale, x1 + node_w + 44 * scale, y1 + 38 * scale, x1 + node_w - 8 * scale, y1 + 42 * scale)
-            elif x2 == x1:
-                side = x1 + node_w + 34 * scale
-                coords = (x1 + node_w, sy, side, sy, side, ey, x1 + node_w, ey)
-            elif x2 > x1:
-                sx, ex = x1 + node_w, x2
-                mid = (sx + ex) / 2
-                coords = (sx, sy, mid, sy, mid, ey, ex, ey)
-            else:
-                sx, ex = x1, x2 + node_w
-                mid = max(ex + 18 * scale, min(sx - 18 * scale, (sx + ex) / 2))
-                coords = (sx, sy, mid, sy, mid, ey, ex, ey)
-            coupling = set(edge.get("coupling_types", []))
-            has_control = bool(edge.get("control_coupling")) or "control" in coupling or edge.get("control_context", False)
-            has_data = bool(edge.get("data_coupling")) or "data" in coupling
-            if has_control and has_data:
-                color, kind = "#7050a0", "CC + DC"
-            elif has_control:
-                color, kind = "#7050a0", "CC"
-            elif has_data:
-                color, kind = "#16865f", "DC"
-            else:
-                color, kind = "#718096", "CALL"
-            state = edge.get("state", "current")
-            canvas.create_line(*coords, fill=state_colors.get(state, "#718096"), width=line_width, arrow=tk.LAST, arrowshape=arrowshape, smooth=True)
-            label = f"{kind} · {state}"
-            mid_x = (coords[0] + coords[-2]) / 2
-            mid_y = (coords[1] + coords[-1]) / 2 - 9 * scale
-            label_width = max(54 * scale, len(label) * edge_font_size * 0.62)
-            canvas.create_rectangle(mid_x - label_width / 2, mid_y - 10 * scale, mid_x + label_width / 2, mid_y + 10 * scale, fill="white", outline="")
-            canvas.create_text(mid_x, mid_y, text=label, fill=color, font=("Segoe UI", edge_font_size, "bold"))
-
-        node_font_size = max(7, int(9 * scale))
-        tag_font_size = max(6, int(8 * scale))
-        for name, (x, y) in positions.items():
-            is_changed = name in changed
-            is_impacted = name in impacted and not is_changed
-            outline, fill, tag = (
-                ("#c23d4b", "#fff0f0", "CHANGED") if is_changed
-                else (("#2767ad", "#eef5ff", "IMPACTED") if is_impacted else ("#9aa7b7", "#ffffff", "FUNCTION"))
-            )
-            canvas.create_rectangle(x, y, x + node_w, y + node_h, fill=fill, outline=outline, width=max(1, 2 * scale if is_changed else scale))
-            canvas.create_text(x + 12 * scale, y + 13 * scale, text=tag, anchor="w", fill=outline, font=("Segoe UI", tag_font_size, "bold"))
-            path, _, symbol = name.partition("::")
-            title_limit = max(9, int((node_w - 24 * scale) / max(1, node_font_size * 0.62)))
-            if len(symbol) > title_limit:
-                symbol = symbol[:title_limit - 3] + "..."
-            canvas.create_text(x + 12 * scale, y + 40 * scale, text=symbol or name, anchor="w", fill="#26364b", font=("Consolas", node_font_size, "bold"))
-            component = components.get(name) or (path if path else "")
-            component_limit = max(10, int((node_w - 24 * scale) / max(1, tag_font_size * 0.62)))
-            if len(component) > component_limit:
-                component = component[:component_limit - 3] + "..."
-            canvas.create_text(x + 12 * scale, y + 66 * scale, text=component, anchor="w", fill="#78879a", font=("Segoe UI", tag_font_size))
-
-        cross_edges = sum(1 for edge in edges if edge.get("cross_component"))
-        self.flow_status.set(
-            f"{len(nodes)} functions · {len(edges)} call/coupling edges · {cross_edges} cross-component · "
-            f"CC = Control Coupling, DC = Data Coupling. Edge color shows added/removed/current state. Use Fit or +/− to resize."
-        )
+        display_w = max(1, round(original.width * scale))
+        display_h = max(1, round(original.height * scale))
+        resized = original.resize((display_w, display_h), Image.Resampling.LANCZOS)
+        self.flow_photo = ImageTk.PhotoImage(resized, master=self.root)
+        canvas.configure(scrollregion=(0, 0, display_w, display_h))
+        canvas.create_image(0, 0, image=self.flow_photo, anchor="nw")
         canvas.xview_moveto(0)
         canvas.yview_moveto(0)
+        self.flow_zoom_label.set(f"{scale:.0%}")
+        report_edges = report.get("edges", [])
+        self.flow_status.set(
+            f"Rendered from impact-flow.mmd by Mermaid.js · {original.width} × {original.height}px · "
+            f"{len(report_edges)} call/coupling edges · Fit or +/− to resize; scroll to inspect details."
+        )
 
     def _show_report(self, result: dict[str, Any]) -> None:
         self.report_paths = result["paths"]
@@ -945,7 +858,7 @@ class DesktopApp:
         self._populate_edge_table(report)
         self.notebook.select(1)
         self.root.update_idletasks()
-        self._draw_flow(report, fit=True)
+        self._draw_flow(report, image_path=self.report_paths.get("mermaid_png"), fit=True)
         self.open_report_button.configure(state="normal")
         self.analyze_button.configure(state="normal")
         self.status.set(f"Analysis complete · report saved to {self.report_paths['markdown']}")

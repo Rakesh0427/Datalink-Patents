@@ -11,6 +11,8 @@ dependencies = [
   "tree-sitter>=0.25,<0.26",
   "tree-sitter-c>=0.24,<0.25",
   "tree-sitter-cpp>=0.23,<0.24",
+  "mermaidx>=0.11.3,<0.12",
+  "Pillow>=10,<13",
 ]
 
 [project.scripts]
