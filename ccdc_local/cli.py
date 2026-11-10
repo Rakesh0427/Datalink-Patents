@@ -42,10 +42,14 @@ def _choose(prompt: str, values: list[dict], default: int = 1) -> dict:
 
 def _normalize_repo_url(value: str) -> str:
     """Accept clone URLs and common repository-browser URLs without branch/query suffixes."""
-    value = value.strip().strip("\\\"")
+    value = value.strip()
     if value.startswith("git clone "):
-        value = value[len("git clone "):].strip().strip("\\\"")
+        value = value[len("git clone "):].strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '\"'}:
+        value = value[1:-1].strip()
     parsed = urlsplit(value)
+    if parsed.password or (parsed.scheme in {"http", "https"} and parsed.username):
+        raise ValueError("Do not embed credentials in the Git URL; configure Git Credential Manager or SSH access instead.")
     host = (parsed.hostname or "").lower()
     parts = [part for part in parsed.path.split("/") if part]
     if host == "github.com" and len(parts) >= 2:

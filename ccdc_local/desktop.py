@@ -180,10 +180,12 @@ class DesktopApp:
         updates_panel = ttk.LabelFrame(split, text="Recent Git updates", padding=5)
         split.add(scr_panel, weight=1)
         split.add(updates_panel, weight=2)
-        self.issue_list = tk.Listbox(scr_panel, height=5, activestyle="dotbox", exportselection=False)
-        self.issue_list.pack(fill="both", expand=True)
-        issue_scroll = ttk.Scrollbar(scr_panel, orient="vertical", command=self.issue_list.yview)
-        issue_scroll.place(relx=1.0, rely=0, relheight=1.0, anchor="ne")
+        issue_list_frame = ttk.Frame(scr_panel)
+        issue_list_frame.pack(fill="both", expand=True)
+        self.issue_list = tk.Listbox(issue_list_frame, height=5, activestyle="dotbox", exportselection=False)
+        self.issue_list.pack(side="left", fill="both", expand=True)
+        issue_scroll = ttk.Scrollbar(issue_list_frame, orient="vertical", command=self.issue_list.yview)
+        issue_scroll.pack(side="right", fill="y")
         self.issue_list.configure(yscrollcommand=issue_scroll.set)
         self.inspect_button = ttk.Button(scr_panel, text="Inspect selected SCR", command=self._inspect_selected, state="disabled")
         self.inspect_button.pack(fill="x", pady=(5, 0))
@@ -357,6 +359,7 @@ class DesktopApp:
             return
         self.selected_issue = issue
         if self.repo_session and self.repo_session.get("repo_label") == repo_value:
+            self._render_repository_details(self.repo_session)
             self._show_issue_refs(self.repo_session, issue)
             return
         self.analyze_button.configure(state="disabled")
@@ -386,6 +389,8 @@ class DesktopApp:
                 parts = line.split("\t", 2)
                 if len(parts) == 3:
                     commits.append({"ref": parts[0], "short": parts[0][:10], "date": parts[1], "subject": parts[2]})
+            if not refs and not commits:
+                raise RuntimeError("Git clone completed, but the repository has no branches or commits to inspect. Verify that this is a non-empty Git repository.")
             issues, issue_matches = discover_git_issues(refs, commits)
             latest = commits[0] if commits else {"subject": "No commits found", "date": ""}
             return {
@@ -408,6 +413,9 @@ class DesktopApp:
         if self.repo_session and self.repo_session is not session:
             self.repo_session["tempdir"].cleanup()
         self.repo_session = session
+        self._render_repository_details(session)
+
+    def _render_repository_details(self, session: dict[str, Any]) -> None:
         self._show_updates(session.get("recent_commits", []))
         latest = session.get("latest_commit", {})
         self.repo_details.set(
@@ -447,7 +455,8 @@ class DesktopApp:
         commits = matches["commits"]
         commit_refs = [item["ref"] for item in commits]
         base_choices = list(dict.fromkeys([session["default_base"], *session["refs"]]))
-        head_choices = list(dict.fromkeys([*branches, *commit_refs, "HEAD", *session["refs"]]))
+        recent_commit_refs = [item["ref"] for item in session.get("recent_commits", [])]
+        head_choices = list(dict.fromkeys([*branches, *commit_refs, "HEAD", *session["refs"], *recent_commit_refs]))
         self.base_combo.configure(values=base_choices)
         self.head_combo.configure(values=head_choices)
         self.base_ref.set(session["default_base"])
