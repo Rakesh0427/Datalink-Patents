@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101828">
+  <title>CC/DC Local Workbench</title>
+  <link rel="stylesheet" href="/assets/styles.css">
+  <script defer src="/assets/app.js"></script>
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <a class="brand" href="#top" aria-label="CC/DC Workbench home">
+        <span class="brand-mark"><span></span><span></span><span></span></span>
+        <span class="brand-copy"><strong>Coupling<span>Guard</span></strong><small>LOCAL WORKBENCH</small></span>
+      </a>
+      <div class="sidebar-rule"></div>
+      <div class="nav-caption">WORKSPACE</div>
+      <a class="nav-item active" href="#setup"><span class="nav-icon">◈</span> New analysis <span class="nav-dot"></span></a>
+      <a class="nav-item" href="#report"><span class="nav-icon">⌁</span> Impact report</a>
+      <div class="sidebar-bottom">
+        <div class="local-card">
+          <span class="pulse"></span>
+          <div><strong>Local-first</strong><small>Source stays on this machine</small></div>
+        </div>
+        <div class="side-note">Static C/C++ analysis<br>with Jira SCR traceability</div>
+        <div class="version">CCDC LOCAL · 0.2</div>
+      </div>
+    </aside>
+
+    <main class="main-content" id="top">
+      <header class="topbar">
+        <div class="breadcrumb">Workbench <span>/</span> <strong>New analysis</strong></div>
+        <div class="top-actions">
+          <span class="secure-pill"><span class="lock-icon">◆</span> LOCAL SESSION</span>
+          <a class="icon-button" href="https://github.com/Rakesh0427/Datalink-Patents" target="_blank" rel="noreferrer" aria-label="Project repository">↗</a>
+        </div>
+      </header>
+
+      <section class="intro" id="setup">
+        <div class="intro-copy">
+          <div class="eyebrow"><span class="eyebrow-line"></span> CHANGE IMPACT · C / C++</div>
+          <h1>See the <span>ripple effect</span><br>before the merge.</h1>
+          <p>Analyze an SCR straight from its Git branch and commit history. Jira is optional for recent-issue browsing and extra issue context.</p>
+        </div>
+        <div class="intro-art" aria-hidden="true">
+          <div class="orbit orbit-one"></div><div class="orbit orbit-two"></div>
+          <div class="orbit-core">CC<br><b>↔</b><br>DC</div>
+          <i class="orbit-node node-a"></i><i class="orbit-node node-b"></i><i class="orbit-node node-c"></i>
+          <div class="art-label art-label-a">CONTROL FLOW</div><div class="art-label art-label-b">DATA FLOW</div>
+        </div>
+      </section>
+
+      <section class="steps" aria-label="Analysis steps">
+        <div class="step active" id="stepOne"><span>01</span><div><strong>Connect</strong><small>Git / optional Jira</small></div></div>
+        <div class="step-connector"></div>
+        <div class="step" id="stepTwo"><span>02</span><div><strong>Select SCR</strong><small>Choose the change</small></div></div>
+        <div class="step-connector"></div>
+        <div class="step" id="stepThree"><span>03</span><div><strong>Analyze</strong><small>Review impact</small></div></div>
+      </section>
+
+      <section class="setup-grid">
+        <article class="panel connect-panel">
+          <div class="panel-heading">
+            <div class="panel-title"><span class="number-badge">01</span><div><h2>Connect your sources</h2><p>Use the SCR key in Git, or optionally browse Jira for recent issues.</p></div></div>
+            <span class="panel-kicker">INPUTS</span>
+          </div>
+          <form id="connectForm">
+            <label class="field-label" for="repoUrl">Git repository URL or local path</label>
+            <div class="input-wrap"><span class="input-icon">⌘</span><input id="repoUrl" name="repoUrl" placeholder="https://github.com/org/flight-software.git" autocomplete="url" required><span class="input-hint">GIT</span></div>
+            <div class="field-note">Private repositories use your installed Git credentials or SSH key.</div>
+            <div class="mode-switch" role="tablist" aria-label="SCR source mode">
+              <button type="button" class="mode-button active" data-mode="git">Use Git SCR</button>
+              <button type="button" class="mode-button" data-mode="jira">Browse Jira</button>
+            </div>
+            <div id="gitFields">
+              <label class="field-label" for="scrKey">SCR number in branch / commit</label>
+              <div class="input-wrap"><span class="input-icon jira-icon">#</span><input id="scrKey" placeholder="SCR-123" autocomplete="off"><span class="input-hint">SCR KEY</span></div>
+              <div class="field-note">No Jira login needed. The tool locates matching Git branches/commits; no Jira summary or status is fetched.</div>
+            </div>
+            <div id="jiraFields" class="hidden">
+              <label class="field-label spaced" for="jiraUrl">Jira site or issue URL</label>
+              <div class="input-wrap"><span class="input-icon jira-icon">◈</span><input id="jiraUrl" name="jiraUrl" placeholder="https://company.atlassian.net" autocomplete="url"></div>
+              <div class="auth-login">
+              <div class="auth-login-heading"><span>JIRA LOGIN</span><span class="local-only-badge">LOCAL ONLY · NOT SAVED</span></div>
+              <label class="field-label" for="authMode">Authentication type</label>
+              <div class="select-wrap auth-mode-wrap"><select class="text-input" id="authMode"><option value="cloud">Jira Cloud · email + API token</option><option value="datacenter">Jira Data Center · personal access token</option></select><span class="select-chevron">⌄</span></div>
+              <div id="cloudLogin" class="credential-grid">
+                <div><label class="field-label" for="jiraEmail">Account email</label><input class="text-input" id="jiraEmail" type="email" autocomplete="username" placeholder="you@company.com"></div>
+                <div><label class="field-label" for="jiraToken">API token</label><input class="text-input secret-input" id="jiraToken" type="password" autocomplete="new-password" placeholder="Paste Jira API token"></div>
+              </div>
+              <div id="dcLogin" class="hidden"><label class="field-label" for="jiraPat">Personal access token</label><input class="text-input secret-input" id="jiraPat" type="password" autocomplete="new-password" placeholder="Paste Jira Data Center PAT"></div>
+              <div class="credential-note">Credentials are used for this Jira request only, held in page memory, and never included in reports.</div>
+            </div>
+            <div class="form-row">
+              <div class="form-col"><label class="field-label spaced" for="projectKey">Project key</label><input class="text-input" id="projectKey" value="SCR" maxlength="20"></div>
+              <div class="form-col"><label class="field-label spaced" for="days">Updated within</label><div class="select-wrap"><select class="text-input" id="days"><option value="7">Last 7 days</option><option value="30" selected>Last 30 days</option><option value="90">Last 90 days</option><option value="180">Last 6 months</option></select><span class="select-chevron">⌄</span></div></div>
+            </div>
+            <div id="authMessage" class="auth-message"><span class="auth-dot"></span><span>Jira mode is optional; Git-only analysis needs no Jira login.</span></div>
+            </div>
+            <button class="primary-button full-button" type="submit" id="findIssuesButton"><span>Inspect SCR in Git</span><span class="button-arrow">→</span></button>
+          </form>
+        </article>
+
+        <article class="panel issues-panel">
+          <div class="panel-heading">
+            <div class="panel-title"><span class="number-badge number-muted">02</span><div><h2 id="issueHeading">SCR to inspect</h2><p id="issueSubhead">Choose Git SCR mode or browse recent Jira issues.</p></div></div>
+            <span class="count-pill" id="issueCount">0 ISSUES</span>
+          </div>
+          <div id="issueList" class="issue-list empty-state">
+            <div class="empty-illustration"><span class="empty-ring ring-1"></span><span class="empty-ring ring-2"></span><span class="empty-center">⌕</span></div>
+            <strong>Ready when you are</strong><p>Enter a Git SCR key or switch to Jira to browse recent issues.</p>
+          </div>
+          <div class="issue-footer"><span class="tiny-shield">◆</span> Git metadata or Jira issue context · local analysis only</div>
+        </article>
+      </section>
+
+      <section class="panel repo-panel hidden" id="repoPanel">
+        <div class="panel-heading">
+          <div class="panel-title"><span class="number-badge number-blue">03</span><div><h2>Choose the code range</h2><p id="repoHint">Select the SCR branch or specify the base and head refs.</p></div></div>
+          <span class="panel-kicker" id="repoState">REPOSITORY</span>
+        </div>
+        <div id="repoLoading" class="loading-row hidden"><span class="spinner"></span> Cloning and inspecting refs locally…</div>
+        <div id="repoControls" class="repo-controls">
+          <div class="match-callout" id="matchCallout"><span class="match-icon">↗</span><span id="matchText">Choose an SCR to inspect repository refs.</span></div>
+          <div class="refs-grid">
+            <div><label class="field-label" for="baseRef">BASE · BEFORE CHANGE</label><input class="text-input ref-select" id="baseRef" list="baseRefOptions" placeholder="origin/main"><datalist id="baseRefOptions"></datalist></div>
+            <div class="range-arrow">→</div>
+            <div><label class="field-label" for="headRef">HEAD · SCR CHANGE</label><input class="text-input ref-select" id="headRef" list="headRefOptions" placeholder="SCR branch / commit"><datalist id="headRefOptions"></datalist></div>
+          </div>
+          <details class="config-details"><summary>Advanced: component / traceability config</summary><label class="field-label" for="configPath">Local path to ccdc.json (optional)</label><input class="text-input" id="configPath" placeholder="C:\\work\\flight-software\\ccdc.json"></details>
+          <button class="primary-button analyze-button" id="analyzeButton" type="button" disabled><span>Analyze selected SCR</span><span class="button-arrow">⟶</span></button>
+        </div>
+      </section>
+
+      <section id="progressPanel" class="panel progress-panel hidden">
+        <div class="progress-content"><span class="spinner large-spinner"></span><div><h2 id="progressTitle">Tracing change impact</h2><p id="progressText">Building the C/C++ dependency view…</p><div class="progress-track"><span></span></div></div></div>
+      </section>
+
+      <section id="errorBanner" class="error-banner hidden" role="alert"><span class="error-symbol">!</span><span id="errorText"></span><button id="dismissError" aria-label="Dismiss error">×</button></section>
+
+      <section class="report-section hidden" id="report">
+        <div class="report-header">
+          <div><div class="eyebrow"><span class="eyebrow-line"></span> ANALYSIS COMPLETE</div><h2>Impact report <span class="complete-check">✓</span></h2><p id="reportMeta">Selected SCR · selected Git range</p></div>
+          <div class="report-actions"><button class="secondary-button" id="downloadMarkdown">↓ <span>Markdown</span></button><button class="secondary-button" id="downloadJson">↓ <span>JSON</span></button></div>
+        </div>
+        <div class="metric-grid">
+          <div class="metric-card"><div class="metric-top"><span>CHANGED FUNCTIONS</span><span class="metric-icon icon-red">✳</span></div><strong id="metricChanged">0</strong><small>Located in selected diff</small></div>
+          <div class="metric-card"><div class="metric-top"><span>IMPACTED FUNCTIONS</span><span class="metric-icon icon-blue">⌘</span></div><strong id="metricImpacted">0</strong><small>Call-graph impact cone</small></div>
+          <div class="metric-card"><div class="metric-top"><span>CONTROL FLOWS</span><span class="metric-icon icon-violet">↗</span></div><strong id="metricControl">0</strong><small>Control influence edges</small></div>
+          <div class="metric-card"><div class="metric-top"><span>DATA FLOWS</span><span class="metric-icon icon-green">⤷</span></div><strong id="metricData">0</strong><small>Data dependency edges</small></div>
+        </div>
+        <div class="report-layout">
+          <article class="panel graph-panel">
+            <div class="panel-heading graph-heading"><div><h3>Impact flow</h3><p>Changed nodes are red · downstream impact is blue</p></div><div class="legend"><span><i class="legend-red"></i>Changed</span><span><i class="legend-blue"></i>Impacted</span></div></div>
+            <div id="graphCanvas" class="graph-canvas"><div class="graph-empty">The flow diagram will appear after analysis.</div></div>
+          </article>
+          <article class="panel summary-panel">
+            <div class="panel-heading"><div><h3>Review checklist</h3><p>Items to verify before accepting the change</p></div></div>
+            <div id="reviewChecklist" class="checklist"></div>
+            <div class="summary-divider"></div>
+            <div class="review-meta"><span>SCR</span><strong id="summaryIssue">—</strong></div>
+            <div class="review-meta"><span>Git range</span><strong id="summaryRange">—</strong></div>
+            <div class="review-meta"><span>Changed files</span><strong id="summaryFiles">0</strong></div>
+          </article>
+        </div>
+        <article class="panel detail-panel">
+          <div class="tab-bar" role="tablist">
+            <button class="tab active" data-tab="flows">Coupling flows <span id="flowTabCount">0</span></button>
+            <button class="tab" data-tab="diff">Source diff</button>
+            <button class="tab" data-tab="mermaid">Mermaid</button>
+            <button class="tab" data-tab="json">JSON</button>
+          </div>
+          <div class="tab-content active" id="tab-flows"><div class="table-wrap"><table><thead><tr><th>CALLER</th><th>RECEIVER</th><th>COUPLING</th><th>CHANGE</th><th>LOCATION</th></tr></thead><tbody id="flowRows"></tbody></table></div></div>
+          <div class="tab-content" id="tab-diff"><pre class="code-view" id="diffView"></pre></div>
+          <div class="tab-content" id="tab-mermaid"><div class="mermaid-note">Copy into a Mermaid renderer to use the diagram elsewhere.</div><pre class="code-view mermaid-code" id="mermaidView"></pre></div>
+          <div class="tab-content" id="tab-json"><pre class="code-view" id="jsonView"></pre></div>
+        </article>
+        <div id="limitations" class="limitations-note"></div>
+      </section>
+
+      <footer class="page-footer"><span>COUPLING GUARD <b>·</b> LOCAL ANALYSIS</span><span>Review static findings with your project verification process.</span></footer>
+    </main>
+  </div>
+  <div class="toast hidden" id="toast"></div>
+</body>
+</html>
