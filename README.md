@@ -110,7 +110,7 @@ Run this from a terminal after activating the virtual environment:
 ccdc-gui
 ```
 
-This opens a native Tk desktop window on your computer. It does **not** start a web server or open a browser. Use the window to enter/select the Git repository, choose Git-only SCR mode or optional Jira browsing, inspect the refs, and run analysis. The terminal is only needed to launch the app; the workflow is in the desktop interface. On Windows, Tkinter is included with the standard python.org Python installer. On Debian/Ubuntu Linux, install `python3-tk` if Tkinter is missing.
+This opens a native Tk desktop window on your computer. It does **not** start a web server or open a browser. In Git-only mode, enter the repository and click **Load repository updates**; the tool scans recent commits and branch names, shows detected SCR keys and recent updates, then lets you select an SCR without typing its key. Common GitHub/GitLab/Bitbucket browser URLs are normalized to repository clone URLs. Jira browsing remains optional. On Windows, Tkinter is included with the standard python.org Python installer. On Debian/Ubuntu Linux, install `python3-tk` if Tkinter is missing.
 
 For a terminal-only workflow, run:
 
