@@ -80,9 +80,9 @@ py -3.11 -m coupling_guard analyze --root . --config coupling.json --base-ref or
 
 Git must be installed and the base ref fetched. The analyzer calls Git with argument-safe subprocess APIs, so it does not depend on shell quoting for the diff itself. The GitHub Actions workflow template supports both Ubuntu and Windows runners; its command steps explicitly use Bash so environment-variable handling is consistent. Copy `examples/github-actions/coupling-guard.yml` to `.github/workflows/coupling-guard.yml` in your GitHub repository to activate it.
 
-## Local C/C++ Git / optional Jira workflow (`ccdc-local`)
+## Local C/C++ desktop GUI and optional Jira (`ccdc-gui`)
 
-This local workflow accepts the repository directly. Jira is optional: Git-only mode uses the SCR key from the branch/commit, while Jira mode calls Jira's REST API from your machine to browse recent issues and attach issue metadata.
+The native desktop tool analyzes Git changes for a selected SCR. Jira is optional: Git-only mode uses the SCR key from the branch/commit; Jira mode browses recent issues and adds summary/status context. Analysis and report generation run locally.
 
 ### Install
 
@@ -100,17 +100,17 @@ Git must be installed. For private repositories, configure Git Credential Manage
 
 ### Configure Jira credentials locally
 
-In the GUI, choose Jira Cloud or Data Center in the **Jira Login** section and enter the corresponding email/token or PAT. These fields are password-masked, used only for the Jira request, and are not written to disk, browser storage, logs, or reports. The UI refuses Jira login on a non-local browser host; run the app on your own machine before entering credentials. The terminal CLI can instead use `JIRA_EMAIL` + `JIRA_API_TOKEN` (Cloud) or `JIRA_PAT` (Data Center) from the local environment. Never commit credentials or a `.env` file.
+In the native desktop GUI, choose Jira Cloud or Data Center and enter the corresponding email/token or PAT. Credential fields are masked and used only for Jira requests; they are not saved to disk or included in reports. The terminal CLI can instead use `JIRA_EMAIL` + `JIRA_API_TOKEN` (Cloud) or `JIRA_PAT` (Data Center) from the local environment. Never commit credentials or a `.env` file.
 
-### Start the GUI or terminal workflow
+### Start the native desktop GUI or terminal workflow
 
-For the browser GUI, run:
+Run this from a terminal after activating the virtual environment:
 
 ```bash
 ccdc-gui
 ```
 
-It opens `http://127.0.0.1:8765` by default and binds to loopback only. Keep the terminal open while using it; press Ctrl+C to stop the local server. Set `CCDC_GUI_PORT` to choose another port. The GUI has three steps: enter Git/Jira links and load recent issues; select an SCR and inspect matching refs; run analysis and review the SVG flow, coupling table, diff, Mermaid source, and JSON report. Report downloads are saved to your browser's normal downloads folder, with full files also written locally under `ccdc-reports/`.
+This opens a native Tk desktop window on your computer. It does **not** start a web server or open a browser. Use the window to enter/select the Git repository, choose Git-only SCR mode or optional Jira browsing, inspect the refs, and run analysis. The terminal is only needed to launch the app; the workflow is in the desktop interface. On Windows, Tkinter is included with the standard python.org Python installer. On Debian/Ubuntu Linux, install `python3-tk` if Tkinter is missing.
 
 For a terminal-only workflow, run:
 
@@ -118,11 +118,7 @@ For a terminal-only workflow, run:
 ccdc-local
 ```
 
-The terminal tool prompts for:
-
-1. A Git repository URL or local Git working-copy path.
-2. A Jira site URL (or a direct Jira issue URL such as `/browse/SCR-123`).
-3. The SCR issue to analyze, selected from issues updated in the last 30 days in project `SCR` by default.
+The CLI prompts for a Git repository URL or local path and an optional Jira URL. Leave Jira blank to enter an SCR key for Git-only analysis. If you provide Jira, it lists recent issues (project `SCR`, updated within the last 30 days by default).
 
 You can set the project and update window on the command line, for example:
 
