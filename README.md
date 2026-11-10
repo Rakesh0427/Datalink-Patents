@@ -100,17 +100,25 @@ Git must be installed. For private repositories, configure Git Credential Manage
 
 ### Configure Jira credentials locally
 
-For Jira Cloud, configure `JIRA_EMAIL` and `JIRA_API_TOKEN` in your local environment. For Jira Data Center, configure `JIRA_PAT` if your instance accepts bearer PAT authentication. Credentials are read from environment variables only; they are not stored in the report or sent to Git.
+In the GUI, choose Jira Cloud or Data Center in the **Jira Login** section and enter the corresponding email/token or PAT. These fields are password-masked, used only for the Jira request, and are not written to disk, browser storage, logs, or reports. The UI refuses Jira login on a non-local browser host; run the app on your own machine before entering credentials. The terminal CLI can instead use `JIRA_EMAIL` + `JIRA_API_TOKEN` (Cloud) or `JIRA_PAT` (Data Center) from the local environment. Never commit credentials or a `.env` file.
 
-On Windows, set these using your normal secure environment/secret-management method before opening the tool. On macOS/Linux, use your shell's secure secret manager or environment configuration. Never commit a `.env` file containing credentials.
+### Start the GUI or terminal workflow
 
-### Start the interactive run
+For the browser GUI, run:
+
+```bash
+ccdc-gui
+```
+
+It opens `http://127.0.0.1:8765` by default and binds to loopback only. Keep the terminal open while using it; press Ctrl+C to stop the local server. Set `CCDC_GUI_PORT` to choose another port. The GUI has three steps: enter Git/Jira links and load recent issues; select an SCR and inspect matching refs; run analysis and review the SVG flow, coupling table, diff, Mermaid source, and JSON report. Report downloads are saved to your browser's normal downloads folder, with full files also written locally under `ccdc-reports/`.
+
+For a terminal-only workflow, run:
 
 ```bash
 ccdc-local
 ```
 
-The tool prompts for:
+The terminal tool prompts for:
 
 1. A Git repository URL or local Git working-copy path.
 2. A Jira site URL (or a direct Jira issue URL such as `/browse/SCR-123`).

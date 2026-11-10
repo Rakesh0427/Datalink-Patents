@@ -34,25 +34,28 @@ def normalize_jira_url(value: str) -> tuple[str, str | None]:
 
 
 class JiraClient:
-    def __init__(self, site_url: str):
+    def __init__(self, site_url: str, auth_mode: str | None = None, email: str | None = None, api_token: str | None = None, pat: str | None = None):
         self.site_url, self.direct_issue = normalize_jira_url(site_url)
-        self.email = os.environ.get("JIRA_EMAIL", "").strip()
-        self.api_token = os.environ.get("JIRA_API_TOKEN", "").strip()
-        self.pat = os.environ.get("JIRA_PAT", "").strip()
-        if not (self.pat or self.api_token):
-            raise JiraError("Set JIRA_API_TOKEN (Cloud) or JIRA_PAT (Data Center) in the local environment before running.")
+        self.auth_mode = auth_mode or ("datacenter" if pat or os.environ.get("JIRA_PAT") else "cloud")
+        self.email = (email if email is not None else os.environ.get("JIRA_EMAIL", "")).strip()
+        self.api_token = (api_token if api_token is not None else os.environ.get("JIRA_API_TOKEN", "")).strip()
+        self.pat = (pat if pat is not None else os.environ.get("JIRA_PAT", "")).strip()
+        if self.auth_mode == "cloud" and not (self.email and self.api_token):
+            raise JiraError("For Jira Cloud, provide an email and API token in the GUI or set JIRA_EMAIL and JIRA_API_TOKEN locally.")
+        if self.auth_mode == "datacenter" and not self.pat:
+            raise JiraError("For Jira Data Center, provide a PAT in the GUI or set JIRA_PAT locally.")
+        if self.auth_mode not in {"cloud", "datacenter"}:
+            raise JiraError("Jira authentication mode must be cloud or datacenter.")
         self.cloud = urlparse(self.site_url).hostname.endswith("atlassian.net") if urlparse(self.site_url).hostname else False
         self.api_version = "3" if self.cloud else "2"
 
     def _headers(self) -> dict[str, str]:
         headers = {"Accept": "application/json"}
-        if self.pat:
+        if self.auth_mode == "datacenter":
             headers["Authorization"] = f"Bearer {self.pat}"
-        elif self.email:
+        else:
             raw = f"{self.email}:{self.api_token}".encode("utf-8")
             headers["Authorization"] = "Basic " + base64.b64encode(raw).decode("ascii")
-        else:
-            raise JiraError("JIRA_EMAIL is required with JIRA_API_TOKEN; use JIRA_PAT for a Data Center bearer token.")
         return headers
 
     def _get(self, path: str, params: dict[str, str] | None = None) -> dict[str, Any]:
