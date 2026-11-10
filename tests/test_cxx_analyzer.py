@@ -73,6 +73,10 @@ class CxxAnalyzerTests(unittest.TestCase):
             self.assertTrue(any("control" in edge["coupling_types"] for edge in report["edges"]))
             self.assertTrue(files["mermaid"].exists())
             self.assertTrue(files["diff"].exists())
+            markdown = files["markdown"].read_text()
+            self.assertIn("## At a glance", markdown)
+            self.assertIn("CC edges — Control Coupling", markdown)
+            self.assertIn("DC edges — Data Coupling", markdown)
 
 
 if __name__ == "__main__":

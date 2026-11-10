@@ -442,6 +442,10 @@ def analyze_change(repo: Path, base_ref: str, head_ref: str, issue: dict[str, An
 
 
 def _markdown(report: dict[str, Any]) -> str:
+    edges = report.get("edges", [])
+    control_edges = sum("control" in edge.get("coupling_types", []) for edge in edges)
+    data_edges = sum("data" in edge.get("coupling_types", []) for edge in edges)
+    cross_component_edges = sum(bool(edge.get("cross_component")) for edge in edges)
     lines = [
         "# C/C++ CC/DC impact report", "",
         f"- **Jira:** [{report['issue'].get('key')}]({report['issue'].get('url') or '#'}) — {report['issue'].get('summary')}",
@@ -450,6 +454,18 @@ def _markdown(report: dict[str, Any]) -> str:
         f"- **Compared:** `{report['base_ref']}` → `{report['head_ref']}` ({report['head_commit']})",
         f"- **Changed C/C++ files:** {len(report['changed_files'])}",
         "",
+        "## At a glance",
+        "| Measure | Count |",
+        "|---|---:|",
+        f"| Changed functions | {len(report['changed_functions'])} |",
+        f"| Impacted functions | {len(report['impacted_functions'])} |",
+        f"| CC edges — Control Coupling | {control_edges} |",
+        f"| DC edges — Data Coupling | {data_edges} |",
+        f"| Cross-component edges | {cross_component_edges} |",
+        f"| Affected requirements | {len(report['affected_requirements'])} |",
+        f"| Recommended tests | {len(report['recommended_tests'])} |",
+        "",
+        "**CC** indicates control coupling; **DC** indicates data coupling. Edge counts can overlap when one call has both types.",
         "> Static heuristic analysis. Review findings; this is not certification evidence by itself.",
         "",
         "## Changed files",
@@ -485,7 +501,7 @@ def _markdown(report: dict[str, Any]) -> str:
     lines += ["", "## Parse and resolution notes"]
     notes = report["parse_warnings"] + report["unresolved_calls"]
     lines += [f"- {note}" for note in notes] or ["- No parser warnings or ambiguous calls reported."]
-    lines += ["", "## Source diff", "See the accompanying `source-diff.patch`.", "", "## Limitations"]
+    lines += ["", "## Flow diagram", "The native desktop GUI renders the call/CC/DC graph from these findings. The accompanying `impact-flow.mmd` is its Mermaid source for external Mermaid-compatible viewers.", "", "## Source diff", "See the accompanying `source-diff.patch`.", "", "## Limitations"]
     lines += [f"- {x}" for x in report["limitations"]]
     return "\n".join(lines) + "\n"
 
