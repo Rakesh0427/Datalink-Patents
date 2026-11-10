@@ -4,7 +4,7 @@ import unittest
 from pathlib import Path
 
 from ccdc_local.cli import _normalize_repo_url
-from ccdc_local.desktop import DesktopApp, discover_git_issues
+from ccdc_local.desktop import DesktopApp, discover_git_issues, flow_node_layers
 
 
 class GitUrlNormalizationTests(unittest.TestCase):
@@ -28,6 +28,19 @@ class GitUrlNormalizationTests(unittest.TestCase):
 
 
 class GitScrDiscoveryTests(unittest.TestCase):
+    def test_flow_layout_places_changed_node_before_downstream_calls(self):
+        layers = flow_node_layers({
+            "changed_functions": ["sensor::convert"],
+            "impacted_functions": ["sensor::convert", "control::update", "output::drive"],
+            "edges": [
+                {"caller": "sensor::convert", "callee": "control::update"},
+                {"caller": "control::update", "callee": "output::drive"},
+            ],
+        })
+        self.assertEqual(layers["sensor::convert"], 0)
+        self.assertLess(layers["sensor::convert"], layers["control::update"])
+        self.assertLess(layers["control::update"], layers["output::drive"])
+
     def test_scr_keys_are_discovered_from_branch_and_commit_metadata(self):
         commits = [
             {"ref": "abc123", "date": "2026-05-01", "subject": "Fix sensor scaling for scr-42"},

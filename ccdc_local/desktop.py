@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
 import tempfile
 import sys
+from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable
@@ -57,6 +59,48 @@ def discover_git_issues(refs: list[str], commits: list[dict[str, str]]) -> tuple
     return issues, matches
 
 
+def flow_node_layers(report: dict[str, Any]) -> dict[str, int]:
+    """Place changed functions at the center and connected call-flow nodes around them."""
+    edges = report.get("edges", [])
+    nodes = set(report.get("changed_functions", [])) | set(report.get("impacted_functions", []))
+    forward: dict[str, set[str]] = defaultdict(set)
+    reverse: dict[str, set[str]] = defaultdict(set)
+    for edge in edges:
+        caller, callee = edge.get("caller"), edge.get("callee")
+        if not caller or not callee:
+            continue
+        nodes.update((caller, callee))
+        forward[caller].add(callee)
+        reverse[callee].add(caller)
+    changed = set(report.get("changed_functions", []))
+    if not nodes:
+        return {}
+    if not changed:
+        return {node: index for index, node in enumerate(sorted(nodes))}
+
+    layers = {node: 0 for node in changed}
+    queue = deque((node, 0) for node in changed)
+    while queue:
+        node, distance = queue.popleft()
+        for child in forward[node]:
+            if child not in layers:
+                layers[child] = distance + 1
+                queue.append((child, distance + 1))
+    queue = deque((node, 0) for node in changed)
+    while queue:
+        node, distance = queue.popleft()
+        for parent in reverse[node]:
+            if parent not in layers:
+                layers[parent] = -(distance + 1)
+                queue.append((parent, distance + 1))
+    max_layer = max(layers.values(), default=0)
+    for node in sorted(nodes - set(layers)):
+        max_layer += 1
+        layers[node] = max_layer
+    shift = min(layers.values(), default=0)
+    return {node: layer - shift for node, layer in layers.items()}
+
+
 class DesktopApp:
     """Native Tk desktop UI for local-only C/C++ Control/Data Coupling analysis."""
 
@@ -98,8 +142,21 @@ class DesktopApp:
         style.configure("Section.TLabelframe.Label", font=("Segoe UI", 10, "bold"))
         style.configure("Primary.TButton", font=("Segoe UI", 10, "bold"), padding=(12, 7))
 
-        outer = ttk.Frame(self.root, padding=(18, 14))
-        outer.pack(fill="both", expand=True)
+        shell = ttk.Frame(self.root)
+        shell.pack(fill="both", expand=True)
+        self.canvas = tk.Canvas(shell, highlightthickness=0, borderwidth=0)
+        page_scroll = ttk.Scrollbar(shell, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=page_scroll.set)
+        page_scroll.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        outer = ttk.Frame(self.canvas, padding=(18, 14))
+        self.outer = outer
+        self.canvas_window = self.canvas.create_window((0, 0), window=outer, anchor="nw")
+        outer.bind("<Configure>", self._update_scrollregion)
+        self.canvas.bind("<Configure>", self._resize_scrollable_page)
+        self.root.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.root.bind_all("<Button-4>", self._on_mousewheel)
+        self.root.bind_all("<Button-5>", self._on_mousewheel)
         header = ttk.Frame(outer)
         header.pack(fill="x", pady=(0, 12))
         ttk.Label(header, text="CC/DC Local Workbench", style="Header.TLabel").pack(anchor="w")
@@ -187,7 +244,9 @@ class DesktopApp:
         issue_scroll = ttk.Scrollbar(issue_list_frame, orient="vertical", command=self.issue_list.yview)
         issue_scroll.pack(side="right", fill="y")
         self.issue_list.configure(yscrollcommand=issue_scroll.set)
-        self.inspect_button = ttk.Button(scr_panel, text="Inspect selected SCR", command=self._inspect_selected, state="disabled")
+        self.issue_list.bind("<<ListboxSelect>>", self._on_issue_list_selection)
+        self.issue_list.bind("<Double-Button-1>", lambda _event: self._inspect_selected())
+        self.inspect_button = ttk.Button(scr_panel, text="Continue with selected SCR", command=self._inspect_selected, state="disabled")
         self.inspect_button.pack(fill="x", pady=(5, 0))
         self.manual_frame = ttk.Frame(scr_panel)
         ttk.Label(self.manual_frame, text="No SCR key found in Git; optional manual fallback:").pack(anchor="w")
@@ -228,10 +287,36 @@ class DesktopApp:
 
         results = ttk.LabelFrame(outer, text="4 · Impact report", style="Section.TLabelframe", padding=8)
         results.pack(fill="both", expand=True, pady=(10, 0))
+        self.results_frame = results
         self.notebook = ttk.Notebook(results)
         self.notebook.pack(fill="both", expand=True)
+        flow_page = ttk.Frame(self.notebook)
+        self.notebook.add(flow_page, text="CC/DC flow diagram")
+        flow_legend = ttk.Frame(flow_page, padding=(8, 5))
+        flow_legend.pack(fill="x")
+        ttk.Label(flow_legend, text="Changed", foreground="#b4232c").pack(side="left", padx=(0, 12))
+        ttk.Label(flow_legend, text="Impacted", foreground="#1f5da8").pack(side="left", padx=(0, 12))
+        ttk.Label(flow_legend, text="CC · Control Coupling", foreground="#7042a5").pack(side="left", padx=(0, 12))
+        ttk.Label(flow_legend, text="DC · Data Coupling", foreground="#167a58").pack(side="left")
+        self.flow_status = tk.StringVar(value="Run an analysis to draw the call and coupling flow.")
+        ttk.Label(flow_page, textvariable=self.flow_status, padding=(8, 3)).pack(anchor="w")
+        flow_body = ttk.Frame(flow_page)
+        flow_body.pack(fill="both", expand=True)
+        self.flow_canvas = tk.Canvas(flow_body, background="white", highlightthickness=0, width=900, height=430)
+        flow_xscroll = ttk.Scrollbar(flow_body, orient="horizontal", command=self.flow_canvas.xview)
+        flow_yscroll = ttk.Scrollbar(flow_body, orient="vertical", command=self.flow_canvas.yview)
+        self.flow_canvas.configure(xscrollcommand=flow_xscroll.set, yscrollcommand=flow_yscroll.set)
+        self.flow_canvas.grid(row=0, column=0, sticky="nsew")
+        flow_yscroll.grid(row=0, column=1, sticky="ns")
+        flow_xscroll.grid(row=1, column=0, sticky="ew")
+        flow_body.rowconfigure(0, weight=1)
+        flow_body.columnconfigure(0, weight=1)
+        self.flow_canvas.bind("<MouseWheel>", self._on_flow_mousewheel)
+        self.flow_canvas.bind("<Button-4>", self._on_flow_mousewheel)
+        self.flow_canvas.bind("<Button-5>", self._on_flow_mousewheel)
+
         self.result_text: dict[str, tk.Text] = {}
-        for title, key in (("Summary", "markdown"), ("Source diff", "diff"), ("Mermaid", "mermaid"), ("JSON", "json")):
+        for title, key in (("Summary", "markdown"), ("Source diff", "diff"), ("Mermaid source", "mermaid"), ("JSON", "json")):
             page = ttk.Frame(self.notebook)
             self.notebook.add(page, text=title)
             text = tk.Text(page, wrap="none", height=9, font=("Consolas", 9), undo=False)
@@ -249,6 +334,49 @@ class DesktopApp:
         self.open_report_button = ttk.Button(result_actions, text="Open report file", command=self._open_report, state="disabled")
         self.open_report_button.pack(side="left")
         ttk.Label(result_actions, text="Reports are saved under ccdc-reports/<SCR-KEY>/").pack(side="left", padx=(10, 0))
+
+    def _update_scrollregion(self, _event: Any = None) -> None:
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _resize_scrollable_page(self, event: tk.Event) -> None:
+        self.canvas.itemconfigure(self.canvas_window, width=event.width)
+
+    def _on_mousewheel(self, event: tk.Event) -> str | None:
+        widget = event.widget
+        if isinstance(widget, (tk.Listbox, tk.Text, tk.Canvas, ttk.Treeview, ttk.Combobox)):
+            return None
+        if getattr(event, "num", None) == 4:
+            self.canvas.yview_scroll(-1, "units")
+        elif getattr(event, "num", None) == 5:
+            self.canvas.yview_scroll(1, "units")
+        elif getattr(event, "delta", 0):
+            self.canvas.yview_scroll(int(-event.delta / 120) or (-1 if event.delta > 0 else 1), "units")
+        return "break"
+
+    def _on_flow_mousewheel(self, event: tk.Event) -> str:
+        if getattr(event, "num", None) == 4:
+            self.flow_canvas.yview_scroll(-1, "units")
+        elif getattr(event, "num", None) == 5:
+            self.flow_canvas.yview_scroll(1, "units")
+        elif getattr(event, "delta", 0):
+            self.flow_canvas.yview_scroll(int(-event.delta / 120) or (-1 if event.delta > 0 else 1), "units")
+        return "break"
+
+    def _scroll_to(self, widget: tk.Widget) -> None:
+        self.root.update_idletasks()
+        page_height = max(1, self.outer.winfo_height())
+        target_y = max(0, widget.winfo_rooty() - self.outer.winfo_rooty())
+        self.canvas.yview_moveto(min(1.0, target_y / page_height))
+
+    def _on_issue_list_selection(self, _event: Any = None) -> None:
+        if self.mode.get() != "git" or not self.repo_session:
+            return
+        selection = self.issue_list.curselection()
+        if not selection:
+            return
+        issue = self.issues[selection[0]]
+        self.selected_issue = issue
+        self._show_issue_refs(self.repo_session, issue)
 
     def _toggle_mode(self) -> None:
         if self.mode.get() == "git":
@@ -328,6 +456,7 @@ class DesktopApp:
         self.repo_details.set(f"Jira returned {len(issues)} issue(s). Repository updates will load after you select an SCR.")
         self.inspect_button.configure(text="Inspect selected SCR", state="normal" if issues else "disabled")
         self.status.set(f"Loaded {len(issues)} Jira issue(s). Select one, then inspect its Git refs.")
+        self._scroll_to(self.issue_frame)
         if not issues:
             messagebox.showinfo("No issues found", "No recent Jira issues matched the selected project and date range.", parent=self.root)
 
@@ -443,6 +572,7 @@ class DesktopApp:
         else:
             self.manual_frame.pack(fill="x", pady=(6, 0))
             self.status.set("Repository loaded, but no SCR-like key was found in its branches or recent commit messages.")
+        self._scroll_to(self.issue_frame)
 
     def _show_jira_repository(self, session: dict[str, Any], issue: dict[str, Any]) -> None:
         self._replace_repository_session(session)
@@ -468,6 +598,7 @@ class DesktopApp:
         else:
             self.status.set(f"No branch or commit mentions {issue['key']}; choose the SCR range from the Git updates list.")
         self.analyze_button.configure(state="normal")
+        self._scroll_to(self.refs_frame)
 
     def _use_manual_key(self) -> None:
         if not self.repo_session:
@@ -504,10 +635,116 @@ class DesktopApp:
                 raise RuntimeError("Base and head refs have no common ancestor.")
             paths = analyze_change(session["path"], base_ref, head_ref, issue, output_dir, config_path, repo_label=session["repo_label"])
             contents = {key: path.read_text(encoding="utf-8") for key, path in paths.items()}
-            return {"paths": paths, "contents": contents}
+            report = json.loads(contents["json"])
+            return {"paths": paths, "contents": contents, "report": report}
 
         self.analyze_button.configure(state="disabled")
         self._run_async(run, self._show_report, f"Analyzing {issue['key']} · {base_ref} → {head_ref}…")
+
+    def _draw_flow(self, report: dict[str, Any]) -> None:
+        canvas = self.flow_canvas
+        canvas.delete("all")
+        edges = report.get("edges", [])
+        changed = set(report.get("changed_functions", []))
+        impacted = set(report.get("impacted_functions", []))
+        nodes = set(changed) | set(impacted)
+        components: dict[str, str] = {}
+        for edge in edges:
+            caller, callee = edge.get("caller"), edge.get("callee")
+            if caller and callee:
+                nodes.update((caller, callee))
+                components[caller] = edge.get("caller_component", "")
+                components[callee] = edge.get("callee_component", "")
+        if not nodes:
+            message = (
+                "No C/C++ files changed in the selected Git range."
+                if not report.get("changed_files")
+                else "No functions or resolvable call flows were found. Review the parse and resolution notes in Summary."
+            )
+            canvas.create_text(450, 200, text=message, fill="#65748a", font=("Segoe UI", 12), width=760)
+            canvas.configure(scrollregion=(0, 0, 900, 430))
+            self.flow_status.set(message)
+            return
+
+        layers = flow_node_layers(report)
+        columns: dict[int, list[str]] = defaultdict(list)
+        for name in sorted(nodes):
+            columns[layers.get(name, 0)].append(name)
+        ordered_layers = sorted(columns)
+        node_w, node_h = 278, 86
+        x_gap, y_gap, margin = 92, 42, 28
+        max_rows = max(len(columns[layer]) for layer in ordered_layers)
+        width = max(900, margin * 2 + len(ordered_layers) * node_w + max(0, len(ordered_layers) - 1) * x_gap)
+        height = max(430, margin * 2 + max_rows * node_h + max(0, max_rows - 1) * y_gap)
+        canvas.configure(scrollregion=(0, 0, width, height))
+        positions: dict[str, tuple[int, int]] = {}
+        for column_index, layer in enumerate(ordered_layers):
+            for row_index, name in enumerate(columns[layer]):
+                positions[name] = (margin + column_index * (node_w + x_gap), margin + row_index * (node_h + y_gap))
+
+        state_colors = {"added": "#16865f", "removed": "#c23d4b", "unchanged": "#8391a3", "current": "#8391a3"}
+        for edge in edges:
+            caller, callee = edge.get("caller"), edge.get("callee")
+            if caller not in positions or callee not in positions:
+                continue
+            x1, y1 = positions[caller]
+            x2, y2 = positions[callee]
+            sy, ey = y1 + node_h // 2, y2 + node_h // 2
+            if caller == callee:
+                coords = (x1 + node_w - 10, y1 + 28, x1 + node_w + 44, y1 - 16, x1 + node_w + 44, y1 + 38, x1 + node_w - 8, y1 + 42)
+            elif x2 == x1:
+                side = x1 + node_w + 34
+                coords = (x1 + node_w, sy, side, sy, side, ey, x1 + node_w, ey)
+            elif x2 > x1:
+                sx, ex = x1 + node_w, x2
+                mid = (sx + ex) // 2
+                coords = (sx, sy, mid, sy, mid, ey, ex, ey)
+            else:
+                sx, ex = x1, x2 + node_w
+                mid = max(ex + 18, min(sx - 18, (sx + ex) // 2))
+                coords = (sx, sy, mid, sy, mid, ey, ex, ey)
+            coupling = set(edge.get("coupling_types", []))
+            has_control = bool(edge.get("control_coupling")) or "control" in coupling or edge.get("control_context", False)
+            has_data = bool(edge.get("data_coupling")) or "data" in coupling
+            if has_control and has_data:
+                color, kind = "#7050a0", "CC + DC"
+            elif has_control:
+                color, kind = "#7050a0", "CC"
+            elif has_data:
+                color, kind = "#16865f", "DC"
+            else:
+                color, kind = "#718096", "CALL"
+            state = edge.get("state", "current")
+            canvas.create_line(*coords, fill=state_colors.get(state, "#718096"), width=2, arrow=tk.LAST, arrowshape=(10, 12, 5), smooth=True)
+            label = f"{kind} · {state}"
+            mid_x = (coords[0] + coords[-2]) // 2
+            mid_y = (coords[1] + coords[-1]) // 2 - 9
+            canvas.create_rectangle(mid_x - 48, mid_y - 10, mid_x + 48, mid_y + 10, fill="white", outline="")
+            canvas.create_text(mid_x, mid_y, text=label, fill=color, font=("Segoe UI", 8, "bold"))
+
+        for name, (x, y) in positions.items():
+            is_changed = name in changed
+            is_impacted = name in impacted and not is_changed
+            outline, fill, tag = (
+                ("#c23d4b", "#fff0f0", "CHANGED") if is_changed
+                else (("#2767ad", "#eef5ff", "IMPACTED") if is_impacted else ("#9aa7b7", "#ffffff", "FUNCTION"))
+            )
+            canvas.create_rectangle(x, y, x + node_w, y + node_h, fill=fill, outline=outline, width=2 if is_changed else 1)
+            canvas.create_text(x + 12, y + 13, text=tag, anchor="w", fill=outline, font=("Segoe UI", 8, "bold"))
+            path, _, symbol = name.partition("::")
+            if len(symbol) > 36:
+                symbol = symbol[:33] + "..."
+            canvas.create_text(x + 12, y + 39, text=symbol or name, anchor="w", fill="#26364b", font=("Consolas", 9, "bold"))
+            component = components.get(name) or (path if path else "")
+            if len(component) > 42:
+                component = component[:39] + "..."
+            canvas.create_text(x + 12, y + 65, text=component, anchor="w", fill="#78879a", font=("Segoe UI", 8))
+
+        cross_edges = sum(1 for edge in edges if edge.get("cross_component"))
+        self.flow_status.set(
+            f"{len(nodes)} functions · {len(edges)} call/coupling edges · {cross_edges} cross-component · "
+            f"CC = Control Coupling, DC = Data Coupling. Edge color shows added/removed/current state."
+        )
 
     def _show_report(self, result: dict[str, Any]) -> None:
         self.report_paths = result["paths"]
@@ -519,6 +756,7 @@ class DesktopApp:
             widget.delete("1.0", tk.END)
             widget.insert("1.0", text)
             widget.configure(state="disabled")
+        self._draw_flow(result["report"])
         self.open_report_button.configure(state="normal")
         self.analyze_button.configure(state="normal")
         self.status.set(f"Analysis complete · report saved to {self.report_paths['markdown']}")
@@ -526,6 +764,7 @@ class DesktopApp:
         if self.repo_session:
             self.repo_session["tempdir"].cleanup()
             self.repo_session = None
+        self._scroll_to(self.results_frame)
 
     def _open_report(self) -> None:
         path = self.report_paths.get("markdown")
