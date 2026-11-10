@@ -109,33 +109,52 @@ def resolve_scr_range(
             progress(None, f"Using {head_ref} against {default_base}; checking out the SCR-matching branch…")
         return resolved, ""
 
-    # If the SCR is already merged or exists only in commit subjects, use the
-    # oldest-to-newest contiguous set of matching commits on one ancestry chain.
+    # Commit-subject matching is safe only when SCR-tagged commits form one
+    # uninterrupted first-parent sequence. Otherwise a range would silently
+    # include unrelated commits between matching messages.
     if commits:
         head_ref = commits[0]["ref"]
         head_sha = _git(["rev-parse", "--verify", f"{head_ref}^{{commit}}"], repo, check=False)
-        chain = [
-            item for item in commits
-            if head_sha and _git(["merge-base", item["ref"], head_sha], repo, check=False) == item["ref"]
+        matching_shas = {item["ref"] for item in commits}
+        history = _git(
+            ["log", "--first-parent", "--format=%H%x09%P%x09%s", head_sha],
+            repo,
+            check=False,
+        ).splitlines() if head_sha else []
+        history_parts = [line.split("\t", 2) for line in history]
+        matching_positions = [
+            index for index, parts in enumerate(history_parts)
+            if parts[0] in matching_shas
         ]
-        oldest = chain[-1]["ref"] if chain else head_ref
-        parent_line = _git(["rev-list", "--parents", "-n", "1", oldest], repo, check=False).split()
-        if len(parent_line) >= 2:
-            base_ref = parent_line[1]
-            if _git(["merge-base", base_ref, head_ref], repo, check=False):
-                resolved = {
-                    "base_ref": base_ref,
-                    "head_ref": head_ref,
-                    "strategy": "matching SCR commit range",
-                    "evidence": f"{len(chain) or 1} matching {key} commit(s), from {oldest[:10]} through {head_ref[:10]}.",
-                }
-                if progress:
-                    progress(None, f"Using the matching SCR commit range ({len(chain) or 1} commit(s))…")
-                return resolved, ""
+        if matching_positions:
+            oldest_index = max(matching_positions)
+            segment = history_parts[:oldest_index + 1]
+            segment_has_only_scr_commits = all(
+                len(parts) == 3 and key in {match.upper() for match in ISSUE_KEY_SCAN_RE.findall(parts[2])}
+                for parts in segment
+            )
+            # A merge introduces side-branch changes not represented by its
+            # first-parent subject; leave those ranges for explicit review.
+            contains_merge = any(len(parts[1].split()) > 1 for parts in segment if len(parts) == 3)
+            oldest = segment[-1][0]
+            parent_refs = segment[-1][1].split() if len(segment[-1]) == 3 else []
+            if segment_has_only_scr_commits and not contains_merge and len(parent_refs) == 1:
+                base_ref = parent_refs[0]
+                if _git(["merge-base", base_ref, head_ref], repo, check=False):
+                    commit_count = len(segment)
+                    resolved = {
+                        "base_ref": base_ref,
+                        "head_ref": head_ref,
+                        "strategy": "matching SCR commit range",
+                        "evidence": f"{commit_count} contiguous {key} commit(s), from {oldest[:10]} through {head_ref[:10]}.",
+                    }
+                    if progress:
+                        progress(None, f"Using the matching SCR commit range ({commit_count} contiguous commit(s))…")
+                    return resolved, ""
 
     reason = (
-        f"No safe Git range could be inferred for {key}. No matching SCR branch/commit was found, "
-        "or the matching commit is the repository root. Include the SCR key in Git metadata or use the optional manual range."
+        f"No safe Git range could be inferred for {key}. Matching commits are absent, non-contiguous, "
+        "or involve a merge/root commit. Include the SCR key on every commit in the change or use the optional manual range."
     )
     return None, reason
 
@@ -539,6 +558,8 @@ class DesktopApp:
         self.canvas.yview_moveto(min(1.0, target_y / page_height))
 
     def _on_issue_list_selection(self, _event: Any = None) -> None:
+        if self._busy:
+            return
         selection = self.issue_list.curselection()
         if not selection:
             return
@@ -1194,6 +1215,7 @@ class DesktopApp:
         self.load_button.configure(state="disabled")
         self.inspect_button.configure(state="disabled")
         self.analyze_button.configure(state="disabled")
+        self.issue_list.configure(state="disabled")
         self.root.configure(cursor="watch")
 
         def run() -> None:
@@ -1215,6 +1237,7 @@ class DesktopApp:
         self._busy = False
         self.root.configure(cursor="")
         self.load_button.configure(state="normal")
+        self.issue_list.configure(state="normal")
         self.inspect_button.configure(state="normal" if self.selected_issue else "disabled")
         callback(result)
         message = completion_text(result) if callable(completion_text) else completion_text
@@ -1224,6 +1247,7 @@ class DesktopApp:
         self._busy = False
         self.root.configure(cursor="")
         self.load_button.configure(state="normal")
+        self.issue_list.configure(state="normal")
         self.inspect_button.configure(state="normal" if self.selected_issue or (self.mode.get() == "jira" and self.issues) else "disabled")
         self.analyze_button.configure(state="normal" if self.repo_session else "disabled")
         if self._progress_animation_running:
