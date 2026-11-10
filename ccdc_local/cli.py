@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import subprocess
 import sys
 import tempfile
@@ -116,26 +117,42 @@ def _select_issue(client: JiraClient, project: str, days: int, issue_key: str | 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="ccdc-local",
-        description="Local C/C++ CC/DC and Jira SCR change-impact report generator.",
-        epilog="Jira credentials are read only from JIRA_EMAIL + JIRA_API_TOKEN (Cloud) or JIRA_PAT (Data Center).",
+        description="Local C/C++ CC/DC change-impact report generator; Jira is optional.",
+        epilog="Use --issue SCR-123 without --jira-url for Git-only analysis. Jira credentials are read only from JIRA_EMAIL + JIRA_API_TOKEN (Cloud) or JIRA_PAT (Data Center).",
     )
     parser.add_argument("--repo", help="Git URL or local Git working-copy path; prompted if omitted")
-    parser.add_argument("--jira-url", help="Jira site URL or direct /browse/SCR-123 URL; prompted if omitted")
+    parser.add_argument("--jira-url", help="optional Jira site or direct issue URL; prompted only when --issue is omitted")
     parser.add_argument("--project", default="SCR", help="Jira project key for recent-issue listing (default: SCR)")
     parser.add_argument("--days", type=int, default=30, help="list issues updated in this many days (default: 30)")
-    parser.add_argument("--issue", help="analyze one Jira key directly instead of listing recent issues")
+    parser.add_argument("--issue", help="analyze an SCR key directly; works without Jira when --jira-url is omitted")
     parser.add_argument("--out", type=Path, default=Path("ccdc-reports"), help="report output directory")
     parser.add_argument("--config", type=Path, help="optional ccdc.json path in the target repository")
     args = parser.parse_args(argv)
 
     try:
         repo_url = (args.repo or _ask("Git repository URL or local path")).strip()
-        jira_url = (args.jira_url or _ask("Jira site or issue URL")).strip()
-        if not repo_url or not jira_url:
-            raise ValueError("Repository and Jira URLs are required.")
-        client = JiraClient(jira_url)
-        issue = _select_issue(client, args.project, args.days, args.issue)
-        issue_key = issue["key"]
+        if not repo_url:
+            raise ValueError("Repository URL or local path is required.")
+        jira_url = (args.jira_url or "").strip()
+        if args.issue:
+            issue_key = args.issue.strip().upper()
+            if not re.fullmatch(r"[A-Z][A-Z0-9]+-\d+", issue_key):
+                raise ValueError("SCR key must look like SCR-123.")
+            if jira_url:
+                issue = JiraClient(jira_url).get_issue(issue_key)
+            else:
+                issue = {"key": issue_key, "summary": "SCR identified from Git", "updated": "Git only", "status": "Jira not queried", "url": None}
+        else:
+            if not jira_url:
+                jira_url = _ask("Jira site URL (leave blank for Git-only SCR analysis)").strip()
+            if jira_url:
+                issue = _select_issue(JiraClient(jira_url), args.project, args.days, None)
+            else:
+                issue_key = _ask("SCR key from the branch/commit, e.g. SCR-123").strip().upper()
+                if not re.fullmatch(r"[A-Z][A-Z0-9]+-\d+", issue_key):
+                    raise ValueError("SCR key must look like SCR-123.")
+                issue = {"key": issue_key, "summary": "SCR identified from Git", "updated": "Git only", "status": "Jira not queried", "url": None}
+            issue_key = issue["key"]
         print(f"\nSelected {issue_key}: {issue.get('summary', '')}")
 
         with tempfile.TemporaryDirectory(prefix="ccdc-local-") as temp:

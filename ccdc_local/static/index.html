@@ -42,7 +42,7 @@
         <div class="intro-copy">
           <div class="eyebrow"><span class="eyebrow-line"></span> CHANGE IMPACT · C / C++</div>
           <h1>See the <span>ripple effect</span><br>before the merge.</h1>
-          <p>Connect a Git repository and Jira SCR. Trace changed code through component boundaries, data dependencies and control paths.</p>
+          <p>Analyze an SCR straight from its Git branch and commit history. Jira is optional for recent-issue browsing and extra issue context.</p>
         </div>
         <div class="intro-art" aria-hidden="true">
           <div class="orbit orbit-one"></div><div class="orbit orbit-two"></div>
@@ -53,7 +53,7 @@
       </section>
 
       <section class="steps" aria-label="Analysis steps">
-        <div class="step active" id="stepOne"><span>01</span><div><strong>Connect</strong><small>Git + Jira</small></div></div>
+        <div class="step active" id="stepOne"><span>01</span><div><strong>Connect</strong><small>Git / optional Jira</small></div></div>
         <div class="step-connector"></div>
         <div class="step" id="stepTwo"><span>02</span><div><strong>Select SCR</strong><small>Choose the change</small></div></div>
         <div class="step-connector"></div>
@@ -63,16 +63,26 @@
       <section class="setup-grid">
         <article class="panel connect-panel">
           <div class="panel-heading">
-            <div class="panel-title"><span class="number-badge">01</span><div><h2>Connect your sources</h2><p>Enter repository and Jira details. Credentials stay in your local environment.</p></div></div>
+            <div class="panel-title"><span class="number-badge">01</span><div><h2>Connect your sources</h2><p>Use the SCR key in Git, or optionally browse Jira for recent issues.</p></div></div>
             <span class="panel-kicker">INPUTS</span>
           </div>
           <form id="connectForm">
             <label class="field-label" for="repoUrl">Git repository URL or local path</label>
             <div class="input-wrap"><span class="input-icon">⌘</span><input id="repoUrl" name="repoUrl" placeholder="https://github.com/org/flight-software.git" autocomplete="url" required><span class="input-hint">GIT</span></div>
             <div class="field-note">Private repositories use your installed Git credentials or SSH key.</div>
-            <label class="field-label spaced" for="jiraUrl">Jira site or issue URL</label>
-            <div class="input-wrap"><span class="input-icon jira-icon">◈</span><input id="jiraUrl" name="jiraUrl" placeholder="https://company.atlassian.net" autocomplete="url" required></div>
-            <div class="auth-login">
+            <div class="mode-switch" role="tablist" aria-label="SCR source mode">
+              <button type="button" class="mode-button active" data-mode="git">Use Git SCR</button>
+              <button type="button" class="mode-button" data-mode="jira">Browse Jira</button>
+            </div>
+            <div id="gitFields">
+              <label class="field-label" for="scrKey">SCR number in branch / commit</label>
+              <div class="input-wrap"><span class="input-icon jira-icon">#</span><input id="scrKey" placeholder="SCR-123" autocomplete="off"><span class="input-hint">SCR KEY</span></div>
+              <div class="field-note">No Jira login needed. The tool locates matching Git branches/commits; no Jira summary or status is fetched.</div>
+            </div>
+            <div id="jiraFields" class="hidden">
+              <label class="field-label spaced" for="jiraUrl">Jira site or issue URL</label>
+              <div class="input-wrap"><span class="input-icon jira-icon">◈</span><input id="jiraUrl" name="jiraUrl" placeholder="https://company.atlassian.net" autocomplete="url"></div>
+              <div class="auth-login">
               <div class="auth-login-heading"><span>JIRA LOGIN</span><span class="local-only-badge">LOCAL ONLY · NOT SAVED</span></div>
               <label class="field-label" for="authMode">Authentication type</label>
               <div class="select-wrap auth-mode-wrap"><select class="text-input" id="authMode"><option value="cloud">Jira Cloud · email + API token</option><option value="datacenter">Jira Data Center · personal access token</option></select><span class="select-chevron">⌄</span></div>
@@ -87,21 +97,22 @@
               <div class="form-col"><label class="field-label spaced" for="projectKey">Project key</label><input class="text-input" id="projectKey" value="SCR" maxlength="20"></div>
               <div class="form-col"><label class="field-label spaced" for="days">Updated within</label><div class="select-wrap"><select class="text-input" id="days"><option value="7">Last 7 days</option><option value="30" selected>Last 30 days</option><option value="90">Last 90 days</option><option value="180">Last 6 months</option></select><span class="select-chevron">⌄</span></div></div>
             </div>
-            <div id="authMessage" class="auth-message"><span class="auth-dot"></span><span>Checking local Jira credentials…</span></div>
-            <button class="primary-button full-button" type="submit" id="findIssuesButton"><span>Find recent SCRs</span><span class="button-arrow">→</span></button>
+            <div id="authMessage" class="auth-message"><span class="auth-dot"></span><span>Jira mode is optional; Git-only analysis needs no Jira login.</span></div>
+            </div>
+            <button class="primary-button full-button" type="submit" id="findIssuesButton"><span>Inspect SCR in Git</span><span class="button-arrow">→</span></button>
           </form>
         </article>
 
         <article class="panel issues-panel">
           <div class="panel-heading">
-            <div class="panel-title"><span class="number-badge number-muted">02</span><div><h2>Recent SCRs</h2><p id="issueSubhead">Issues will appear here after you connect Jira.</p></div></div>
+            <div class="panel-title"><span class="number-badge number-muted">02</span><div><h2 id="issueHeading">SCR to inspect</h2><p id="issueSubhead">Choose Git SCR mode or browse recent Jira issues.</p></div></div>
             <span class="count-pill" id="issueCount">0 ISSUES</span>
           </div>
           <div id="issueList" class="issue-list empty-state">
             <div class="empty-illustration"><span class="empty-ring ring-1"></span><span class="empty-ring ring-2"></span><span class="empty-center">⌕</span></div>
-            <strong>Ready when you are</strong><p>Connect your Jira site to load recently updated SCRs.</p>
+            <strong>Ready when you are</strong><p>Enter a Git SCR key or switch to Jira to browse recent issues.</p>
           </div>
-          <div class="issue-footer"><span class="tiny-shield">◆</span> Fetched from Jira · never stored remotely by this app</div>
+          <div class="issue-footer"><span class="tiny-shield">◆</span> Git metadata or Jira issue context · local analysis only</div>
         </article>
       </section>
 
@@ -112,7 +123,7 @@
         </div>
         <div id="repoLoading" class="loading-row hidden"><span class="spinner"></span> Cloning and inspecting refs locally…</div>
         <div id="repoControls" class="repo-controls">
-          <div class="match-callout" id="matchCallout"><span class="match-icon">↗</span><span id="matchText">Choose a Jira issue to inspect repository refs.</span></div>
+          <div class="match-callout" id="matchCallout"><span class="match-icon">↗</span><span id="matchText">Choose an SCR to inspect repository refs.</span></div>
           <div class="refs-grid">
             <div><label class="field-label" for="baseRef">BASE · BEFORE CHANGE</label><input class="text-input ref-select" id="baseRef" list="baseRefOptions" placeholder="origin/main"><datalist id="baseRefOptions"></datalist></div>
             <div class="range-arrow">→</div>

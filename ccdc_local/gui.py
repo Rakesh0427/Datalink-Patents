@@ -135,7 +135,7 @@ def list_issues(payload: IssueListRequest) -> dict[str, Any]:
 def open_repo(payload: RepoOpenRequest) -> dict[str, Any]:
     issue_key = payload.issue_key.upper()
     if not ISSUE_KEY_RE.fullmatch(issue_key):
-        raise HTTPException(400, "Select a Jira issue key such as SCR-123.")
+        raise HTTPException(400, "Use a valid SCR issue key such as SCR-123.")
     _safe_repo_input(payload.repo_url)
     tmp = tempfile.TemporaryDirectory(prefix="ccdc-gui-")
     repo = Path(tmp.name) / "repo"

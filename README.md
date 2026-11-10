@@ -1,6 +1,6 @@
 # Coupling Guard (CC/DC change-impact prototype)
 
-This repository contains two local prototypes for **Control Coupling (CC)**, **Data Coupling (DC)**, and change impact: `coupling-guard` analyzes configured Python source, while `ccdc-local` accepts a local or remote Git repository plus Jira input and analyzes C/C++ changes linked to a selected SCR. The C/C++ tool lists recent Jira issues, finds matching Git branches/commits where possible, and writes a source diff, impact report, JSON findings, and Mermaid flow diagram. Analysis runs locally; the tool fetches issue metadata from Jira and clones source using the user's normal Git credentials.
+This repository contains local prototypes for **Control Coupling (CC)**, **Data Coupling (DC)**, and change impact: `coupling-guard` analyzes configured Python source, while `ccdc-local` analyzes C/C++ changes for a selected SCR using Git. **Jira is optional**: use the SCR key in a branch/commit for Git-only analysis, or connect Jira to browse recent issues and add summary/status context. Reports include source diffs, JSON findings, and Mermaid flow diagrams. Analysis runs locally; the tool fetches Jira metadata only when Jira mode is selected and clones source using the user's normal Git credentials.
 
 > **Scope and safety:** The C/C++ prototype uses Tree-sitter syntax parsing and heuristic call resolution. It is not a compiler-semantic analyzer, does not execute target tests or collect runtime coupling coverage, does not support Ada, and is not DO-178B/C qualified. Its results are not proof of certification compliance. Review all findings and unresolved calls; DO-178 use requires project-specific verification, configuration management, tool assessment/qualification where applicable, and approval by the responsible engineering/certification team.
 
@@ -80,9 +80,9 @@ py -3.11 -m coupling_guard analyze --root . --config coupling.json --base-ref or
 
 Git must be installed and the base ref fetched. The analyzer calls Git with argument-safe subprocess APIs, so it does not depend on shell quoting for the diff itself. The GitHub Actions workflow template supports both Ubuntu and Windows runners; its command steps explicitly use Bash so environment-variable handling is consistent. Copy `examples/github-actions/coupling-guard.yml` to `.github/workflows/coupling-guard.yml` in your GitHub repository to activate it.
 
-## Local C/C++ + Jira workflow (`ccdc-local`)
+## Local C/C++ Git / optional Jira workflow (`ccdc-local`)
 
-This is the interactive local workflow requested for supplying the repository and Jira links directly to the tool. It does not require a Jira connector in GitHub; it calls Jira's REST API from your machine.
+This local workflow accepts the repository directly. Jira is optional: Git-only mode uses the SCR key from the branch/commit, while Jira mode calls Jira's REST API from your machine to browse recent issues and attach issue metadata.
 
 ### Install
 
@@ -136,6 +136,12 @@ The command still displays the recent issue list and asks you to select one. To 
 ccdc-local --repo "https://github.com/example/flight-software.git" --jira-url "https://example.atlassian.net" --issue SCR-123
 ```
 
+For Jira-free analysis, provide the Git repository and SCR key only:
+
+```bash
+ccdc-local --repo "https://github.com/example/flight-software.git" --issue SCR-123
+```
+
 After selection, it looks for branches or commit messages containing the SCR key. If found, select the candidate branch/commit and the base ref. If there is no issue-key match, the tool prompts for base and head refs. **For reliable automatic mapping, use the SCR key in branch names or commit messages**, for example `feature/SCR-123-calibration` and `Fix sensor scale SCR-123`. A Jira issue list alone cannot establish which code change belongs to that issue.
 
 The tool clones the source into a temporary local directory, checks out the selected head there, compares the selected base/head, and deletes the temporary clone when analysis completes. Reports remain locally under `ccdc-reports/<SCR-KEY>/`:
@@ -149,7 +155,7 @@ Open the Markdown report in an editor and `impact-flow.mmd` in a Mermaid-compati
 
 ### Windows example
 
-In PowerShell, after installing the package and setting Jira credentials in the environment:
+In PowerShell, after installing the package (Jira credentials are needed only if using Jira mode):
 
 ```powershell
 ccdc-local --repo "https://github.com/example/flight-software.git" --jira-url "https://example.atlassian.net" --project SCR --days 30 --out "C:\work\ccdc-reports"

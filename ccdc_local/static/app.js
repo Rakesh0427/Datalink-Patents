@@ -1,5 +1,5 @@
 const $ = (selector) => document.querySelector(selector);
-const state = { issues: [], selectedIssue: null, sessionId: null, repoData: null, jobId: null, report: null };
+const state = { mode: "git", issues: [], selectedIssue: null, sessionId: null, repoData: null, jobId: null, report: null };
 const api = async (url, body) => {
   const response = await fetch(url, {
     method: body === undefined ? "GET" : "POST",
@@ -90,22 +90,41 @@ function renderIssues(issues) {
 async function fetchIssues(event) {
   event.preventDefault();
   clearError();
-  if (!isLocalBrowser) return showError("This is a remote UI preview. Start ccdc-gui on your own computer to use your Jira credentials and repository.");
   const button = $("#findIssuesButton");
   const repoUrl = $("#repoUrl").value.trim();
-  const jiraUrl = $("#jiraUrl").value.trim();
-  if (!repoUrl || !jiraUrl) return showError("Enter both the Git repository and Jira URL first.");
-  setBusy(button, true, "Loading recent SCRs…");
+  if (!repoUrl) return showError("Enter the Git repository URL or local path first.");
+  if (state.mode === "jira" && !isLocalBrowser) return showError("Jira login is disabled in the remote preview. Run ccdc-gui locally to use credentials.");
+  setBusy(button, true, state.mode === "git" ? "Preparing Git SCR…" : "Loading recent SCRs…");
   try {
+    if (state.mode === "git") {
+      const key = $("#scrKey").value.trim().toUpperCase();
+      if (!/^[A-Z][A-Z0-9]+-\d+$/.test(key)) return showError("Enter the SCR issue key, for example SCR-123. Jira is not needed for Git-only analysis.");
+      const issue = { key, summary: "SCR identified from Git", updated: "Git only", status: "Jira not queried", url: null };
+      state.issues = [issue];
+      state.selectedIssue = null;
+      state.sessionId = null;
+      $("#issueCount").textContent = "1 SCR";
+      $("#issueSubhead").textContent = "Issue key supplied from the Git branch / commit convention.";
+      renderIssues(state.issues);
+      $("#repoPanel").classList.add("hidden");
+      $("#report").classList.add("hidden");
+      $("#stepOne").classList.add("done");
+      $("#stepTwo").classList.add("active");
+      await selectIssue(issue);
+      return;
+    }
+
+    const jiraUrl = $("#jiraUrl").value.trim();
+    if (!jiraUrl) return showError("Enter the Jira site URL, or switch to Use Git SCR to analyze without Jira.");
     const authMode = $("#authMode").value;
     const email = $("#jiraEmail").value.trim();
     const apiToken = $("#jiraToken").value;
     const pat = $("#jiraPat").value;
     if (authMode === "cloud" && ((!email && !window.__jiraEnvAuthConfigured) || (!apiToken && !window.__jiraEnvAuthConfigured))) {
-      return showError("For Jira Cloud, enter your account email and API token, or configure JIRA_EMAIL and JIRA_API_TOKEN before starting the app.");
+      return showError("For Jira Cloud, enter your account email and API token, or configure JIRA_EMAIL and JIRA_API_TOKEN locally.");
     }
     if (authMode === "datacenter" && !pat && !window.__jiraEnvAuthConfigured) {
-      return showError("For Jira Data Center, enter your personal access token or configure JIRA_PAT before starting the app.");
+      return showError("For Jira Data Center, enter your personal access token or configure JIRA_PAT locally.");
     }
     const result = await api("/api/issues", {
       jira_url: jiraUrl,
@@ -341,7 +360,36 @@ $("#analyzeButton").addEventListener("click", analyzeSelected);
 $("#dismissError").addEventListener("click", clearError);
 $("#downloadMarkdown").addEventListener("click", () => state.report && download("ccdc-report.md", state.report.markdown, "text/markdown"));
 $("#downloadJson").addEventListener("click", () => state.report && download("ccdc-report.json", JSON.stringify(state.report.json, null, 2), "application/json"));
+function setMode(mode) {
+  clearError();
+  state.mode = mode;
+  document.querySelectorAll(".mode-button").forEach((button) => button.classList.toggle("active", button.dataset.mode === mode));
+  $("#gitFields").classList.toggle("hidden", mode !== "git");
+  $("#jiraFields").classList.toggle("hidden", mode !== "jira");
+  const label = $("#findIssuesButton").querySelector("span");
+  label.textContent = mode === "git" ? "Inspect SCR in Git" : "Find recent SCRs";
+  $("#issueHeading").textContent = mode === "git" ? "SCR to inspect" : "Recent SCRs";
+  $("#issueSubhead").textContent = mode === "git" ? "Enter the SCR key used in the branch or commit." : "Issues will appear after you connect Jira.";
+  $("#issueList").classList.add("empty-state");
+  $("#issueList").innerHTML = mode === "git"
+    ? '<div class="empty-illustration"><span class="empty-ring ring-1"></span><span class="empty-ring ring-2"></span><span class="empty-center">⌘</span></div><strong>Git is enough to analyze the change</strong><p>Enter an SCR key. Jira is optional for issue summaries and recent-issue search.</p>'
+    : '<div class="empty-illustration"><span class="empty-ring ring-1"></span><span class="empty-ring ring-2"></span><span class="empty-center">⌕</span></div><strong>Browse Jira issues</strong><p>Load recently updated SCRs from your Jira project.</p>';
+  $("#issueCount").textContent = "0 ISSUES";
+  state.issues = [];
+  state.selectedIssue = null;
+  state.sessionId = null;
+  $("#repoPanel").classList.add("hidden");
+  $("#progressPanel").classList.add("hidden");
+  $("#report").classList.add("hidden");
+  $("#analyzeButton").disabled = true;
+  $("#stepOne").classList.remove("done");
+  $("#stepOne").classList.add("active");
+  $("#stepTwo").classList.remove("done", "active");
+  $("#stepThree").classList.remove("done", "active");
+}
+
 setupTabs();
+document.querySelectorAll(".mode-button").forEach((button) => button.addEventListener("click", () => setMode(button.dataset.mode)));
 $("#authMode").addEventListener("change", () => {
   const cloud = $("#authMode").value === "cloud";
   $("#cloudLogin").classList.toggle("hidden", !cloud);
