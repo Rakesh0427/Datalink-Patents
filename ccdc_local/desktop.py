@@ -8,6 +8,8 @@ import tempfile
 import sys
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
+from math import sqrt
 from pathlib import Path
 from typing import Any, Callable
 
@@ -18,12 +20,15 @@ except ModuleNotFoundError:  # Tkinter ships with python.org Python on Windows/m
     tk = None  # type: ignore[assignment]
     filedialog = messagebox = ttk = None  # type: ignore[assignment]
 
-from .analyzer import ProgressCallback, analyze_change
+from .analyzer import ProgressCallback, analyze_change, render_mermaid_png
 from .cli import _clone_repo, _default_base, _git
 from .jira import JiraClient
 
 ISSUE_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]+-\d+$")
 ISSUE_KEY_SCAN_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b", re.IGNORECASE)
+MAX_FLOW_RENDER_PIXELS = 24_000_000
+MAX_FLOW_RENDER_WIDTH = 8_000
+MAX_FLOW_RENDER_HEIGHT = 6_000
 
 
 def discover_git_issues(
@@ -451,7 +456,9 @@ class DesktopApp:
         self.notebook.add(flow_page, text="Rendered Mermaid flow")
         self.flow_report: dict[str, Any] | None = None
         self.flow_png_path: Path | None = None
+        self.flow_mermaid_source: str | None = None
         self.flow_zoom = 1.0
+        self._flow_render_request = 0
         self.flow_photo: Any = None
         self.flow_image_original: Any = None
         flow_legend = ttk.Frame(flow_page, padding=(8, 5))
@@ -462,6 +469,7 @@ class DesktopApp:
         flow_zoom_controls = ttk.Frame(flow_legend)
         flow_zoom_controls.pack(side="right")
         ttk.Button(flow_zoom_controls, text="Fit", command=self._fit_flow).pack(side="left", padx=2)
+        ttk.Button(flow_zoom_controls, text="100%", command=self._actual_flow_size).pack(side="left", padx=2)
         ttk.Button(flow_zoom_controls, text="−", width=3, command=lambda: self._zoom_flow(0.8)).pack(side="left", padx=2)
         ttk.Button(flow_zoom_controls, text="+", width=3, command=lambda: self._zoom_flow(1.25)).pack(side="left", padx=2)
         self.flow_zoom_label = tk.StringVar(value="Fit")
@@ -1034,6 +1042,10 @@ class DesktopApp:
         if self.flow_report is not None and self.flow_png_path is not None:
             self._draw_flow(self.flow_report, fit=True)
 
+    def _actual_flow_size(self) -> None:
+        if self.flow_report is not None and self.flow_png_path is not None:
+            self._draw_flow(self.flow_report, zoom=1.0)
+
     def _zoom_flow(self, factor: float) -> None:
         if self.flow_report is not None and self.flow_png_path is not None:
             self._draw_flow(self.flow_report, zoom=self.flow_zoom * factor)
@@ -1074,8 +1086,19 @@ class DesktopApp:
         if viewport_h <= 2:
             viewport_h = max(280, self.root.winfo_height() - 450)
 
+        max_scale = min(
+            4.0,
+            MAX_FLOW_RENDER_WIDTH / original.width,
+            MAX_FLOW_RENDER_HEIGHT / original.height,
+            sqrt(MAX_FLOW_RENDER_PIXELS / (original.width * original.height)),
+        )
+        tall_flow = original.height / original.width >= 3.0
         if zoom is not None:
-            scale = max(0.15, min(4.0, zoom))
+            scale = max(0.15, min(max_scale, zoom))
+        elif fit and tall_flow:
+            # For a tall graph, fit the width and allow vertical scrolling rather
+            # than shrinking labels to unreadable text just to fit its full height.
+            scale = min((viewport_w - 30) / original.width, max_scale)
         elif fit:
             scale = max(0.15, min((viewport_w - 30) / original.width, (viewport_h - 30) / original.height, 1.0))
         else:
@@ -1083,6 +1106,8 @@ class DesktopApp:
         self.flow_zoom = scale
         display_w = max(1, round(original.width * scale))
         display_h = max(1, round(original.height * scale))
+        self._flow_render_request += 1
+        request_id = self._flow_render_request
         resized = original.resize((display_w, display_h), Image.Resampling.LANCZOS)
         self.flow_photo = ImageTk.PhotoImage(resized, master=self.root)
         canvas.configure(scrollregion=(0, 0, display_w, display_h))
@@ -1092,12 +1117,72 @@ class DesktopApp:
         self.flow_zoom_label.set(f"{scale:.0%}")
         report_edges = report.get("edges", [])
         self.flow_status.set(
-            f"Rendered from impact-flow.mmd by Mermaid.js · {original.width} × {original.height}px · "
-            f"{len(report_edges)} analyzed edges. Large graphs are summarized; Edge Details / JSON retain all findings. Use Fit or +/− to resize."
+            f"Mermaid.js · {original.width} × {original.height}px source · viewing {display_w} × {display_h}px · "
+            f"{len(report_edges)} analyzed edges. Diagram is summarized; Edge Details / JSON retain findings."
+        )
+        if self.flow_mermaid_source and (zoom is not None or (fit and tall_flow)):
+            self.flow_status.set(f"Rendering a sharp Mermaid.js view at {display_w} × {display_h}px…")
+            self.executor.submit(
+                self._render_flow_zoom,
+                request_id,
+                self.flow_mermaid_source,
+                display_w,
+                display_h,
+            )
+
+    def _render_flow_zoom(self, request_id: int, source: str, width: int, height: int) -> None:
+        try:
+            png_bytes = render_mermaid_png(source, width, height)
+            error = None
+        except Exception as exc:
+            png_bytes = None
+            error = str(exc)
+        try:
+            self.root.after(0, self._finish_flow_zoom, request_id, source, width, height, png_bytes, error)
+        except tk.TclError:
+            pass
+
+    def _finish_flow_zoom(
+        self,
+        request_id: int,
+        source: str,
+        width: int,
+        height: int,
+        png_bytes: bytes | None,
+        error: str | None,
+    ) -> None:
+        if request_id != self._flow_render_request or source != self.flow_mermaid_source:
+            return
+        if error or png_bytes is None:
+            detail = (error or "unknown rendering error").replace("\\n", " ")[:180]
+            self.flow_status.set(f"High-resolution Mermaid render failed; showing the preview. {detail}")
+            return
+        from PIL import Image, ImageTk
+
+        with Image.open(BytesIO(png_bytes)) as rendered:
+            image = rendered.convert("RGB")
+        if image.size != (width, height):
+            image = image.resize((width, height), Image.Resampling.LANCZOS)
+        canvas = self.flow_canvas
+        xview = canvas.xview()
+        yview = canvas.yview()
+        self.flow_photo = ImageTk.PhotoImage(image, master=self.root)
+        canvas.delete("all")
+        canvas.configure(scrollregion=(0, 0, width, height))
+        canvas.create_image(0, 0, image=self.flow_photo, anchor="nw")
+        if xview:
+            canvas.xview_moveto(xview[0])
+        if yview:
+            canvas.yview_moveto(yview[0])
+        edge_count = len((self.flow_report or {}).get("edges", []))
+        self.flow_status.set(
+            f"Sharp Mermaid.js render · {width} × {height}px · {edge_count} analyzed edges. "
+            "Diagram is summarized; Edge Details / JSON retain findings."
         )
 
     def _show_report(self, result: dict[str, Any]) -> None:
         self.report_paths = result["paths"]
+        self.flow_mermaid_source = result["contents"].get("mermaid")
         for key, text in result["contents"].items():
             if key not in self.result_text:
                 continue
