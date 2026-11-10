@@ -21,6 +21,40 @@ from .cli import _clone_repo, _default_base, _git
 from .jira import JiraClient
 
 ISSUE_KEY_RE = re.compile(r"^[A-Z][A-Z0-9]+-\d+$")
+ISSUE_KEY_SCAN_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b", re.IGNORECASE)
+
+
+def discover_git_issues(refs: list[str], commits: list[dict[str, str]]) -> tuple[list[dict[str, Any]], dict[str, dict[str, list[Any]]]]:
+    """Collect SCR-like keys from refs and recent commit subjects without Jira."""
+    matches: dict[str, dict[str, list[Any]]] = {}
+
+    def ensure(key: str) -> dict[str, list[Any]]:
+        normalized = key.upper()
+        return matches.setdefault(normalized, {"branches": [], "commits": []})
+
+    for ref in refs:
+        for key in ISSUE_KEY_SCAN_RE.findall(ref):
+            branches = ensure(key)["branches"]
+            if ref not in branches:
+                branches.append(ref)
+    for commit in commits:
+        for key in ISSUE_KEY_SCAN_RE.findall(commit.get("subject", "")):
+            bucket = ensure(key)["commits"]
+            if commit not in bucket:
+                bucket.append(commit)
+
+    issues = []
+    for key, found in matches.items():
+        newest = found["commits"][0] if found["commits"] else {}
+        issues.append({
+            "key": key,
+            "summary": newest.get("subject") or f"SCR key in {found['branches'][0]}",
+            "updated": newest.get("date", ""),
+            "status": "Git commit" if newest else "Git branch",
+            "url": None,
+        })
+    issues.sort(key=lambda issue: (issue.get("updated", ""), issue["key"]), reverse=True)
+    return issues, matches
 
 
 class DesktopApp:
@@ -93,11 +127,11 @@ class DesktopApp:
 
         self.git_frame = ttk.Frame(source)
         self.git_frame.grid(row=4, column=0, columnspan=4, sticky="ew")
-        ttk.Label(self.git_frame, text="SCR key in branch / commit (for example SCR-123)").grid(row=0, column=0, sticky="w")
-        ttk.Entry(self.git_frame, textvariable=self.scr_key, width=32).grid(row=1, column=0, sticky="w", pady=(4, 0))
-        ttk.Label(self.git_frame, text="Git metadata is enough to locate matching branches and commits; Jira is not queried.").grid(
-            row=1, column=1, sticky="w", padx=(12, 0)
-        )
+        ttk.Label(
+            self.git_frame,
+            text="Load the repository to see its recent commits and SCR keys found in branch names / commit messages. Select an SCR below; no key entry is needed.",
+            wraplength=940,
+        ).grid(row=0, column=0, sticky="w")
 
         self.jira_frame = ttk.LabelFrame(source, text="Optional Jira details", padding=8)
         self.jira_frame.grid(row=5, column=0, columnspan=4, sticky="ew", pady=(7, 0))
@@ -136,15 +170,40 @@ class DesktopApp:
         self.status_label = ttk.Label(actions, textvariable=self.status)
         self.status_label.pack(side="left", padx=(12, 0))
 
-        self.issue_frame = ttk.LabelFrame(outer, text="2 · Jira issues (Jira mode only)", style="Section.TLabelframe", padding=8)
+        self.issue_frame = ttk.LabelFrame(outer, text="2 · SCRs and Git updates", style="Section.TLabelframe", padding=8)
         self.issue_frame.pack(fill="x", pady=(10, 0))
-        self.issue_list = tk.Listbox(self.issue_frame, height=4, activestyle="dotbox", exportselection=False)
-        self.issue_list.pack(side="left", fill="x", expand=True)
-        issue_scroll = ttk.Scrollbar(self.issue_frame, orient="vertical", command=self.issue_list.yview)
-        issue_scroll.pack(side="right", fill="y")
+        self.repo_details = tk.StringVar(value="Load a repository to see its branches, SCR keys, and recent commits.")
+        ttk.Label(self.issue_frame, textvariable=self.repo_details).pack(anchor="w", pady=(0, 6))
+        split = ttk.Panedwindow(self.issue_frame, orient="horizontal")
+        split.pack(fill="x", expand=True)
+        scr_panel = ttk.LabelFrame(split, text="SCRs to select", padding=5)
+        updates_panel = ttk.LabelFrame(split, text="Recent Git updates", padding=5)
+        split.add(scr_panel, weight=1)
+        split.add(updates_panel, weight=2)
+        self.issue_list = tk.Listbox(scr_panel, height=5, activestyle="dotbox", exportselection=False)
+        self.issue_list.pack(fill="both", expand=True)
+        issue_scroll = ttk.Scrollbar(scr_panel, orient="vertical", command=self.issue_list.yview)
+        issue_scroll.place(relx=1.0, rely=0, relheight=1.0, anchor="ne")
         self.issue_list.configure(yscrollcommand=issue_scroll.set)
-        self.inspect_button = ttk.Button(self.issue_frame, text="Inspect selected Jira SCR", command=self._inspect_selected, state="disabled")
-        self.inspect_button.pack(side="right", padx=(8, 0), fill="y")
+        self.inspect_button = ttk.Button(scr_panel, text="Inspect selected SCR", command=self._inspect_selected, state="disabled")
+        self.inspect_button.pack(fill="x", pady=(5, 0))
+        self.manual_frame = ttk.Frame(scr_panel)
+        ttk.Label(self.manual_frame, text="No SCR key found in Git; optional manual fallback:").pack(anchor="w")
+        manual_row = ttk.Frame(self.manual_frame)
+        manual_row.pack(fill="x", pady=(3, 0))
+        ttk.Entry(manual_row, textvariable=self.scr_key).pack(side="left", fill="x", expand=True)
+        ttk.Button(manual_row, text="Use key", command=self._use_manual_key).pack(side="left", padx=(5, 0))
+        self.update_list = ttk.Treeview(updates_panel, columns=("date", "ref", "subject"), show="headings", height=5)
+        self.update_list.heading("date", text="DATE")
+        self.update_list.heading("ref", text="COMMIT")
+        self.update_list.heading("subject", text="UPDATE / SCR KEY")
+        self.update_list.column("date", width=90, stretch=False)
+        self.update_list.column("ref", width=100, stretch=False)
+        self.update_list.column("subject", width=420, stretch=True)
+        self.update_list.pack(fill="both", expand=True)
+        update_scroll = ttk.Scrollbar(updates_panel, orient="vertical", command=self.update_list.yview)
+        update_scroll.pack(side="right", fill="y")
+        self.update_list.configure(yscrollcommand=update_scroll.set)
 
         refs = ttk.LabelFrame(outer, text="3 · Choose the Git change range", style="Section.TLabelframe", padding=10)
         refs.pack(fill="x", pady=(10, 0))
@@ -192,15 +251,14 @@ class DesktopApp:
     def _toggle_mode(self) -> None:
         if self.mode.get() == "git":
             self.jira_frame.grid_remove()
-            self.issue_frame.pack_forget()
             self.git_frame.grid()
-            self.load_button.configure(text="Inspect SCR in Git")
-            self.inspect_button.configure(state="disabled")
-            self.status.set("Git-only mode · no Jira request or Jira credentials needed.")
+            self.issue_frame.configure(text="2 · SCRs discovered from Git")
+            self.load_button.configure(text="Load repository updates")
+            self.status.set("Git-only mode · load the repository to discover SCR keys in its branches and commits.")
         else:
             self.git_frame.grid_remove()
             self.jira_frame.grid()
-            self.issue_frame.pack(fill="x", pady=(10, 0), before=self.refs_frame)
+            self.issue_frame.configure(text="2 · Jira issues and Git updates")
             self.load_button.configure(text="Find recent SCRs in Jira")
             self.status.set("Jira mode · Jira supplies issue metadata; code analysis still runs locally.")
         self._toggle_auth()
@@ -229,12 +287,7 @@ class DesktopApp:
             messagebox.showerror("Repository required", "Enter a Git URL or choose a local Git folder.", parent=self.root)
             return
         if self.mode.get() == "git":
-            issue_key = self.scr_key.get().strip().upper()
-            if not ISSUE_KEY_RE.fullmatch(issue_key):
-                messagebox.showerror("SCR key required", "Enter a valid key such as SCR-123.", parent=self.root)
-                return
-            issue = {"key": issue_key, "summary": "SCR identified from Git", "updated": "Git only", "status": "Jira not queried", "url": None}
-            self._start_repo_inspection(repo_value, issue)
+            self._start_git_discovery(repo_value)
             return
 
         jira_url = self.jira_url.get().strip()
@@ -258,14 +311,20 @@ class DesktopApp:
 
         self._run_async(fetch, self._show_issues, "Fetching recent SCRs from Jira…")
 
-    def _show_issues(self, issues: list[dict[str, Any]]) -> None:
+    def _fill_issue_list(self, issues: list[dict[str, Any]]) -> None:
         self.issues = issues
         self.issue_list.delete(0, tk.END)
         for issue in issues:
             summary = issue.get("summary") or "(No summary)"
-            status = issue.get("status") or issue.get("issue_type") or ""
-            self.issue_list.insert(tk.END, f"{issue.get('key', '')}  ·  {summary}  ·  {status}")
-        self.inspect_button.configure(state="normal" if issues else "disabled")
+            updated = issue.get("updated", "")[:10]
+            self.issue_list.insert(tk.END, f"{issue.get('key', '')}  ·  {summary}  ·  {updated}")
+
+    def _show_issues(self, issues: list[dict[str, Any]]) -> None:
+        self._fill_issue_list(issues)
+        self._show_updates([])
+        self.manual_frame.pack_forget()
+        self.repo_details.set(f"Jira returned {len(issues)} issue(s). Repository updates will load after you select an SCR.")
+        self.inspect_button.configure(text="Inspect selected SCR", state="normal" if issues else "disabled")
         self.status.set(f"Loaded {len(issues)} Jira issue(s). Select one, then inspect its Git refs.")
         if not issues:
             messagebox.showinfo("No issues found", "No recent Jira issues matched the selected project and date range.", parent=self.root)
@@ -273,54 +332,144 @@ class DesktopApp:
     def _inspect_selected(self) -> None:
         selection = self.issue_list.curselection()
         if not selection:
-            messagebox.showinfo("Select an SCR", "Choose an issue from the list first.", parent=self.root)
+            messagebox.showinfo("Select an SCR", "Choose an SCR from the list first.", parent=self.root)
             return
-        self._start_repo_inspection(self.repo_value.get().strip(), self.issues[selection[0]])
+        issue = self.issues[selection[0]]
+        if self.mode.get() == "git":
+            self.selected_issue = issue
+            if self.repo_session:
+                self._show_issue_refs(self.repo_session, issue)
+            return
+        self._start_repo_inspection(self.repo_value.get().strip(), issue)
+
+    def _start_git_discovery(self, repo_value: str) -> None:
+        self.selected_issue = None
+        self.analyze_button.configure(state="disabled")
+        self._run_async(
+            lambda: self._inspect_repo(repo_value),
+            self._show_git_repository,
+            "Cloning/fetching repository and scanning branches + recent commits…",
+        )
 
     def _start_repo_inspection(self, repo_value: str, issue: dict[str, Any]) -> None:
         if not repo_value:
             messagebox.showerror("Repository required", "Enter a Git URL or choose a local Git folder.", parent=self.root)
             return
         self.selected_issue = issue
+        if self.repo_session and self.repo_session.get("repo_label") == repo_value:
+            self._show_issue_refs(self.repo_session, issue)
+            return
         self.analyze_button.configure(state="disabled")
-        self._run_async(lambda: self._inspect_repo(repo_value, issue), self._show_repo, f"Cloning/fetching Git repository for {issue['key']}…")
+        self._run_async(
+            lambda: self._inspect_repo(repo_value),
+            lambda session: self._show_jira_repository(session, issue),
+            f"Loading repository details for {issue['key']}…",
+        )
 
     @staticmethod
-    def _inspect_repo(repo_value: str, issue: dict[str, Any]) -> dict[str, Any]:
+    def _inspect_repo(repo_value: str) -> dict[str, Any]:
         tempdir = tempfile.TemporaryDirectory(prefix="ccdc-desktop-")
         repo = Path(tempdir.name) / "repo"
         try:
             _clone_repo(repo_value, repo)
-            refs = sorted({ref for ref in _git(["for-each-ref", "--format=%(refname:short)", "refs/remotes/origin", "refs/heads"], repo, check=False).splitlines() if ref and not ref.endswith("/HEAD")})
-            key = issue["key"].upper()
-            branches = [ref for ref in refs if key.lower() in ref.lower()]
-            log = _git(["log", "--all", "--regexp-ignore-case", f"--grep={key}", "--format=%H%x09%s"], repo, check=False)
+            refs = sorted({
+                ref for ref in _git(["for-each-ref", "--format=%(refname:short)", "refs/remotes/origin", "refs/heads"], repo, check=False).splitlines()
+                if ref and not ref.endswith("/HEAD")
+            })
+            raw_log = _git(
+                ["log", "--all", "--max-count=5000", "--date=short", "--format=%H%x09%ad%x09%s"],
+                repo,
+                check=False,
+            )
             commits = []
-            for line in log.splitlines()[:50]:
-                parts = line.split("\t", 1)
-                if len(parts) == 2:
-                    commits.append({"ref": parts[0], "subject": parts[1]})
-            return {"tempdir": tempdir, "path": repo, "repo_label": repo_value, "refs": refs, "branches": branches, "commits": commits, "default_base": _default_base(repo), "issue": issue}
+            for line in raw_log.splitlines():
+                parts = line.split("\t", 2)
+                if len(parts) == 3:
+                    commits.append({"ref": parts[0], "short": parts[0][:10], "date": parts[1], "subject": parts[2]})
+            issues, issue_matches = discover_git_issues(refs, commits)
+            latest = commits[0] if commits else {"subject": "No commits found", "date": ""}
+            return {
+                "tempdir": tempdir,
+                "path": repo,
+                "repo_label": repo_value,
+                "refs": refs,
+                "commits": commits,
+                "recent_commits": commits[:100],
+                "discovered_issues": issues,
+                "issue_matches": issue_matches,
+                "default_base": _default_base(repo),
+                "latest_commit": latest,
+            }
         except Exception:
             tempdir.cleanup()
             raise
 
-    def _show_repo(self, session: dict[str, Any]) -> None:
-        if self.repo_session:
+    def _replace_repository_session(self, session: dict[str, Any]) -> None:
+        if self.repo_session and self.repo_session is not session:
             self.repo_session["tempdir"].cleanup()
         self.repo_session = session
+        self._show_updates(session.get("recent_commits", []))
+        latest = session.get("latest_commit", {})
+        self.repo_details.set(
+            f"{session['repo_label']}  ·  base {session['default_base']}  ·  {len(session['refs'])} refs  ·  "
+            f"{len(session['commits'])} commits scanned  ·  latest: {latest.get('date', '')} {latest.get('subject', '')}"
+        )
+
+    def _show_updates(self, commits: list[dict[str, str]]) -> None:
+        for item in self.update_list.get_children():
+            self.update_list.delete(item)
+        for commit in commits:
+            subject = commit.get("subject", "")
+            keys = ", ".join(dict.fromkeys(key.upper() for key in ISSUE_KEY_SCAN_RE.findall(subject)))
+            display = f"{keys} · {subject}" if keys else subject
+            self.update_list.insert("", "end", values=(commit.get("date", ""), commit.get("short", ""), display))
+
+    def _show_git_repository(self, session: dict[str, Any]) -> None:
+        self._replace_repository_session(session)
+        issues = session["discovered_issues"]
+        self._fill_issue_list(issues)
+        self.inspect_button.configure(text="Inspect selected SCR", state="normal" if issues else "disabled")
+        if issues:
+            self.manual_frame.pack_forget()
+            self.status.set(f"Found {len(issues)} SCR key(s) in repository history. Select one to inspect matching refs.")
+        else:
+            self.manual_frame.pack(fill="x", pady=(6, 0))
+            self.status.set("Repository loaded, but no SCR-like key was found in its branches or recent commit messages.")
+
+    def _show_jira_repository(self, session: dict[str, Any], issue: dict[str, Any]) -> None:
+        self._replace_repository_session(session)
+        self.selected_issue = issue
+        self._show_issue_refs(session, issue)
+
+    def _show_issue_refs(self, session: dict[str, Any], issue: dict[str, Any]) -> None:
+        matches = session["issue_matches"].get(issue["key"].upper(), {"branches": [], "commits": []})
+        branches = matches["branches"]
+        commits = matches["commits"]
+        commit_refs = [item["ref"] for item in commits]
         base_choices = list(dict.fromkeys([session["default_base"], *session["refs"]]))
-        head_choices = list(dict.fromkeys(["HEAD", *session["branches"], *(item["ref"] for item in session["commits"]), *session["refs"]]))
+        head_choices = list(dict.fromkeys([*branches, *commit_refs, "HEAD", *session["refs"]]))
         self.base_combo.configure(values=base_choices)
         self.head_combo.configure(values=head_choices)
         self.base_ref.set(session["default_base"])
-        self.head_ref.set(session["branches"][0] if session["branches"] else (session["commits"][0]["ref"] if session["commits"] else "HEAD"))
-        match_count = len(session["branches"]) + len(session["commits"])
-        if match_count:
-            self.status.set(f"Found {len(session['branches'])} matching branch(es) and {len(session['commits'])} matching commit(s). Verify base/head before analysis.")
+        self.head_ref.set(branches[0] if branches else (commit_refs[0] if commit_refs else "HEAD"))
+        if branches or commits:
+            self.status.set(
+                f"{issue['key']}: found {len(branches)} matching branch(es) and {len(commits)} commit(s). Verify refs before analysis."
+            )
         else:
-            self.status.set(f"No branch or commit mentions {session['issue']['key']}; select the SCR change range manually.")
+            self.status.set(f"No branch or commit mentions {issue['key']}; choose the SCR range from the Git updates list.")
         self.analyze_button.configure(state="normal")
+
+    def _use_manual_key(self) -> None:
+        if not self.repo_session:
+            return
+        key = self.scr_key.get().strip().upper()
+        if not ISSUE_KEY_RE.fullmatch(key):
+            messagebox.showerror("Invalid SCR key", "Enter a valid key such as SCR-123.", parent=self.root)
+            return
+        issue = {"key": key, "summary": "Manually identified SCR", "updated": "Git only", "status": "Jira not queried", "url": None}
+        self.selected_issue = issue
+        self._show_issue_refs(self.repo_session, issue)
 
     def _analyze(self) -> None:
         if not self.repo_session or not self.selected_issue:

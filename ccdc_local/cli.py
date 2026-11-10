@@ -7,6 +7,7 @@ import sys
 import tempfile
 from pathlib import Path
 from typing import Sequence
+from urllib.parse import urlsplit, urlunsplit
 
 from .analyzer import analyze_change
 from .jira import JiraClient, JiraError
@@ -39,7 +40,30 @@ def _choose(prompt: str, values: list[dict], default: int = 1) -> dict:
         print("Enter one of the listed numbers.")
 
 
+def _normalize_repo_url(value: str) -> str:
+    """Accept clone URLs and common repository-browser URLs without branch/query suffixes."""
+    value = value.strip().strip("\\\"")
+    if value.startswith("git clone "):
+        value = value[len("git clone "):].strip().strip("\\\"")
+    parsed = urlsplit(value)
+    host = (parsed.hostname or "").lower()
+    parts = [part for part in parsed.path.split("/") if part]
+    if host == "github.com" and len(parts) >= 2:
+        parts = parts[:2]
+    elif host == "gitlab.com" and "-" in parts:
+        parts = parts[:parts.index("-")]
+    elif host == "bitbucket.org" and "src" in parts[2:]:
+        parts = parts[:parts.index("src")]
+    if parsed.scheme in {"https", "http", "ssh", "git"} and parsed.netloc:
+        path = "/" + "/".join(parts)
+        if host == "github.com" and parts and not parts[-1].endswith(".git"):
+            path += ".git"
+        return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+    return value
+
+
 def _clone_repo(repo_url: str, destination: Path) -> None:
+    repo_url = _normalize_repo_url(repo_url)
     local = Path(repo_url).expanduser()
     if local.exists():
         source = local.resolve()
@@ -51,10 +75,16 @@ def _clone_repo(repo_url: str, destination: Path) -> None:
         command = ["git", "clone", "--no-single-branch", repo_url, str(destination)]
     result = subprocess.run(command, text=True, capture_output=True)
     if result.returncode:
-        raise RuntimeError(f"Could not clone repository. Check the URL and your local Git credential setup.\n{result.stderr.strip()}")
+        detail = result.stderr.strip() or result.stdout.strip() or "Git returned no diagnostic output."
+        raise RuntimeError(
+            "Git could not clone this repository. Paste the repository URL (not a commit/issue page), "
+            "and for private repositories verify Git Credential Manager or SSH access.\n\n"
+            f"Git output: {detail}"
+        )
     fetch = subprocess.run(["git", "fetch", "--all", "--prune"], cwd=destination, text=True, capture_output=True)
     if fetch.returncode:
-        raise RuntimeError(f"Could not fetch repository refs: {fetch.stderr.strip()}")
+        detail = fetch.stderr.strip() or fetch.stdout.strip() or "Git returned no diagnostic output."
+        raise RuntimeError(f"The repository cloned, but Git could not fetch all refs. Check network/access and retry.\n\nGit output: {detail}")
 
 
 def _default_base(repo: Path) -> str:
