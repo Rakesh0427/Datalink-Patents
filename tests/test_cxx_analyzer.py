@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from ccdc_local.analyzer import analyze_change
+from ccdc_local.analyzer import MAX_MERMAID_EDGES, MAX_MERMAID_FUNCTIONS, analyze_change, _mermaid
 
 
 class CxxAnalyzerTests(unittest.TestCase):
@@ -79,7 +79,10 @@ class CxxAnalyzerTests(unittest.TestCase):
             self.assertTrue(files["mermaid_svg"].exists())
             self.assertTrue(files["mermaid_png"].exists())
             self.assertIn("<svg", files["mermaid_svg"].read_text())
-            self.assertTrue(files["mermaid_png"].read_bytes().startswith(b"\x89PNG\r\n\x1a\n"))
+            png_bytes = files["mermaid_png"].read_bytes()
+            self.assertTrue(png_bytes.startswith(b"\x89PNG\r\n\x1a\n"))
+            self.assertLessEqual(int.from_bytes(png_bytes[16:20], "big"), 2400)
+            self.assertLessEqual(int.from_bytes(png_bytes[20:24], "big"), 1800)
             self.assertTrue(files["diff"].exists())
             markdown = files["markdown"].read_text()
             self.assertIn("## At a glance", markdown)
@@ -91,6 +94,32 @@ class CxxAnalyzerTests(unittest.TestCase):
             self.assertEqual(determinate, sorted(determinate))
             self.assertTrue(any("parsed" in message and "/" in message for _percent, message in progress_events))
             self.assertTrue(any("baseline source blobs" in message for _percent, message in progress_events))
+
+    def test_mermaid_diagram_caps_large_graphs_and_reports_omitted_content(self):
+        names = [f"src/module_{index:03}::function_{index:03}#1" for index in range(300)]
+        report = {
+            "changed_functions": [names[150]],
+            "impacted_functions": names,
+            "edges": [
+                {
+                    "caller": names[index],
+                    "callee": names[index + 1],
+                    "coupling_types": ["data"],
+                    "state": "unchanged",
+                    "path": f"src/module_{index:03}.cpp",
+                    "line": index + 1,
+                }
+                for index in range(len(names) - 1)
+            ],
+        }
+        source = _mermaid(report)
+        node_lines = [line for line in source.splitlines() if line.startswith("  N") and '["' in line]
+        edge_lines = [line for line in source.splitlines() if " -->|" in line]
+        self.assertEqual(len(node_lines), MAX_MERMAID_FUNCTIONS)
+        self.assertLessEqual(len(edge_lines), MAX_MERMAID_EDGES)
+        self.assertIn("Diagram limit:", source)
+        self.assertIn(f"{len(names) - MAX_MERMAID_FUNCTIONS} functions", source)
+        self.assertIn("Edge Details / JSON", source)
 
 
 if __name__ == "__main__":

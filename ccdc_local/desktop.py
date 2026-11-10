@@ -920,7 +920,7 @@ class DesktopApp:
         report_edges = report.get("edges", [])
         self.flow_status.set(
             f"Rendered from impact-flow.mmd by Mermaid.js · {original.width} × {original.height}px · "
-            f"{len(report_edges)} call/coupling edges · Fit or +/− to resize; scroll to inspect details."
+            f"{len(report_edges)} analyzed edges. Large graphs are summarized; Edge Details / JSON retain all findings. Use Fit or +/− to resize."
         )
 
     def _show_report(self, result: dict[str, Any]) -> None:

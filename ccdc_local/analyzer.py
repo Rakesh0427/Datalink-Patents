@@ -5,7 +5,7 @@ import os
 import re
 import subprocess
 import tempfile
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -17,6 +17,11 @@ import tree_sitter_cpp
 EXTENSIONS = {".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp", ".hxx", ".C", ".H"}
 SKIP_DIRS = {".git", ".svn", "build", "dist", "out", "target", "vendor", "third_party", "node_modules", ".venv", "venv"}
 ProgressCallback = Callable[[float | None, str], None]
+MAX_MERMAID_FUNCTIONS = 40
+MAX_MERMAID_EDGES = 100
+MERMAID_MAX_TEXT_SIZE = 200_000
+MERMAID_PNG_MAX_WIDTH = 2400
+MERMAID_PNG_MAX_HEIGHT = 1800
 
 
 def _notify_progress(progress: ProgressCallback | None, value: float | None, message: str) -> None:
@@ -551,9 +556,23 @@ def _render_mermaid(source: str, svg_path: Path, png_path: Path) -> None:
     """Render the exact Mermaid source with Mermaid.js via the local mermaidx engine."""
     import mermaidx
 
-    diagram = mermaidx.render(source, backend="js:mermaid")
-    diagram.save(str(svg_path), format="svg")
-    diagram.save(str(png_path), scale=2, background="#ffffff", format="png")
+    diagram = mermaidx.render(
+        source,
+        backend="js:mermaid",
+        config={"maxTextSize": MERMAID_MAX_TEXT_SIZE},
+    )
+    svg = diagram.svg()
+    svg_path.write_text(svg, encoding="utf-8")
+    view_box = re.search(r'viewBox="([^"]+)"', svg)
+    if view_box:
+        dimensions = [float(item) for item in view_box.group(1).split()]
+        view_width, view_height = dimensions[2:4]
+    else:
+        view_width, view_height = MERMAID_PNG_MAX_WIDTH, MERMAID_PNG_MAX_HEIGHT
+    scale = min(MERMAID_PNG_MAX_WIDTH / view_width, MERMAID_PNG_MAX_HEIGHT / view_height)
+    png_width = max(1, round(view_width * scale))
+    png_height = max(1, round(view_height * scale))
+    png_path.write_bytes(diagram.png(width=png_width, height=png_height, background="#ffffff"))
 
 
 def _markdown(report: dict[str, Any]) -> str:
@@ -616,35 +635,80 @@ def _markdown(report: dict[str, Any]) -> str:
     lines += ["", "## Parse and resolution notes"]
     notes = report["parse_warnings"] + report["unresolved_calls"]
     lines += [f"- {note}" for note in notes] or ["- No parser warnings or ambiguous calls reported."]
-    lines += ["", "## Flow diagram", "The accompanying `impact-flow.mmd` is rendered locally by Mermaid.js into `impact-flow.svg` and `impact-flow.png`; the desktop GUI displays the rendered PNG.", "", "## Source diff", "See the accompanying `source-diff.patch`.", "", "## Limitations"]
+    lines += ["", "## Flow diagram", f"The accompanying `impact-flow.mmd` is rendered locally by Mermaid.js into `impact-flow.svg` and `impact-flow.png`; the desktop GUI displays the rendered PNG. For readability and renderer stability, this diagram is capped at {MAX_MERMAID_FUNCTIONS} functions and {MAX_MERMAID_EDGES} edges. Full findings remain available in the edge-details table and JSON.", "", "## Source diff", "See the accompanying `source-diff.patch`.", "", "## Limitations"]
     lines += [f"- {x}" for x in report["limitations"]]
     return "\n".join(lines) + "\n"
 
 
 def _mermaid(report: dict[str, Any]) -> str:
-    lines = ["flowchart LR"]
-    changed, impacted = set(report["changed_functions"]), set(report["impacted_functions"])
-    names = set(changed) | set(impacted)
-    for edge in report["edges"]:
-        names.update((edge["caller"], edge["callee"]))
-    ids = {name: f"N{index}" for index, name in enumerate(sorted(names))}
+    """Build a readable Mermaid view, capped so large repositories remain renderable."""
+    edges = report.get("edges", [])
+    changed = set(report.get("changed_functions", []))
+    impacted = set(report.get("impacted_functions", []))
+    all_names = changed | impacted
+    neighbors: dict[str, set[str]] = defaultdict(set)
+    for edge in edges:
+        caller, callee = edge.get("caller"), edge.get("callee")
+        if caller and callee:
+            all_names.update((caller, callee))
+            neighbors[caller].add(callee)
+            neighbors[callee].add(caller)
+
+    # Keep the changed functions and their nearest callers/callees first; full
+    # findings remain available in JSON and the edge-details table.
+    distance: dict[str, int] = {}
+    queue = deque()
+    for name in sorted(changed & all_names):
+        distance[name] = 0
+        queue.append(name)
+    while queue:
+        name = queue.popleft()
+        for neighbor in sorted(neighbors[name]):
+            if neighbor not in distance:
+                distance[neighbor] = distance[name] + 1
+                queue.append(neighbor)
+    ordered_names = sorted(all_names, key=lambda name: (distance.get(name, float("inf")), name))
+    selected_names = set(ordered_names[:MAX_MERMAID_FUNCTIONS])
+    connected_edges = [
+        edge for edge in edges
+        if edge.get("caller") in selected_names and edge.get("callee") in selected_names
+    ]
+    connected_edges.sort(key=lambda edge: (
+        distance.get(edge.get("caller", ""), float("inf")) + distance.get(edge.get("callee", ""), float("inf")),
+        edge.get("caller", ""), edge.get("callee", ""), edge.get("path", ""), edge.get("line", 0),
+    ))
+    selected_edges = connected_edges[:MAX_MERMAID_EDGES]
+    omitted_functions = len(all_names) - len(selected_names)
+    omitted_edges = len(edges) - len(selected_edges)
+
+    lines = [
+        "flowchart LR",
+        f"%% Showing {len(selected_names)} of {len(all_names)} functions and {len(selected_edges)} of {len(edges)} edges.",
+    ]
+    ids = {name: f"N{index}" for index, name in enumerate(sorted(selected_names))}
     for name, node_id in ids.items():
-        label = name.replace('"', "'")
+        label = name.replace('"', "'").replace("\n", " ")
+        if len(label) > 120:
+            label = label[:117] + "..."
         lines.append(f'  {node_id}["{label}"]')
-    for edge in report["edges"]:
+    for edge in selected_edges:
         kinds = []
-        if "control" in edge["coupling_types"]:
+        coupling_types = edge.get("coupling_types", [])
+        if "control" in coupling_types:
             kinds.append("CC · Control Coupling")
-        if "data" in edge["coupling_types"]:
+        if "data" in coupling_types:
             kinds.append("DC · Data Coupling")
         label = " + ".join(kinds) or "Call"
-        label += f" · {edge['state']}"
+        label += f" · {edge.get('state', 'current')}"
         lines.append(f'  {ids[edge["caller"]]} -->|"{label}"| {ids[edge["callee"]]}')
     for name, node_id in ids.items():
         if name in changed:
             lines.append(f"  style {node_id} fill:#ffd6d6,stroke:#c00,stroke-width:3px")
         elif name in impacted:
             lines.append(f"  style {node_id} fill:#fff0c2,stroke:#a66b00,stroke-width:2px")
-    if len(lines) == 1:
+    if omitted_functions or omitted_edges:
+        lines.append(f'  More["Diagram limit: {omitted_functions} functions and {omitted_edges} edges omitted. See Edge Details / JSON for all findings."]')
+        lines.append("  style More fill:#f3f4f6,stroke:#64748b,stroke-dasharray: 5 5")
+    if not selected_names:
         lines.append('  Empty["No resolved flows"]')
     return "\n".join(lines) + "\n"
