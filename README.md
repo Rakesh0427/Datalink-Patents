@@ -1,8 +1,8 @@
 # Coupling Guard (CC/DC change-impact prototype)
 
-Coupling Guard is a small, dependency-free Python prototype for demonstrating **Control Coupling (CC)**, **Data Coupling (DC)**, change-impact analysis, and GitHub pull-request checks. It analyzes the configured Python source, traces resolvable function calls and parameter uses, maps changed files to impacted functions, and recommends requirement-linked tests.
+This repository contains two local prototypes for **Control Coupling (CC)**, **Data Coupling (DC)**, and change impact: `coupling-guard` analyzes configured Python source, while `ccdc-local` accepts a local or remote Git repository plus Jira input and analyzes C/C++ changes linked to a selected SCR. The C/C++ tool lists recent Jira issues, finds matching Git branches/commits where possible, and writes a source diff, impact report, JSON findings, and Mermaid flow diagram. Analysis runs locally; the tool fetches issue metadata from Jira and clones source using the user's normal Git credentials.
 
-> **Scope and safety:** This repository originally had no application source or declared implementation language, so this first implementation is a runnable Python MVP with a deliberately small demo. It is not a C/C++/Ada analyzer, it does not collect runtime coupling coverage, it is not DO-178B/C qualified, and its results are not proof of certification compliance. DO-178 use requires project-specific verification, configuration management, tool assessment/qualification where applicable, and review by the responsible engineering/certification team.
+> **Scope and safety:** The C/C++ prototype uses Tree-sitter syntax parsing and heuristic call resolution. It is not a compiler-semantic analyzer, does not execute target tests or collect runtime coupling coverage, does not support Ada, and is not DO-178B/C qualified. Its results are not proof of certification compliance. Review all findings and unresolved calls; DO-178 use requires project-specific verification, configuration management, tool assessment/qualification where applicable, and approval by the responsible engineering/certification team.
 
 ## End-to-end example
 
@@ -22,7 +22,7 @@ The Python source is under `demo_project/`. `coupling.json` declares component b
 
 ## Run locally
 
-Requirements: Python 3.10 or newer. No third-party Python package is required.
+Requirements: Python 3.10 or newer. The Python analyzer uses only the standard library. Install the C/C++ parser dependencies for `ccdc-local` with `python -m pip install -e .` (or `py -3.11 -m pip install -e .` on Windows).
 
 From the repository root:
 
@@ -62,9 +62,10 @@ The suite includes tests for the example application and analyzer. A successful 
 
 ### Windows (PowerShell)
 
-Open PowerShell in the repository root. The implementation uses Python's standard library, so no package installation is needed:
+Open PowerShell in the repository root. Install the package once (this also installs the C/C++ parsers), then run the Python demo and tests:
 
 ```powershell
+py -3.11 -m pip install -e .
 py -3.11 -m coupling_guard analyze --root . --config coupling.json --changed demo_project/sensor.py --out reports
 py -3.11 -m unittest discover -v
 ```
@@ -78,6 +79,108 @@ py -3.11 -m coupling_guard analyze --root . --config coupling.json --base-ref or
 ```
 
 Git must be installed and the base ref fetched. The analyzer calls Git with argument-safe subprocess APIs, so it does not depend on shell quoting for the diff itself. The GitHub Actions workflow template supports both Ubuntu and Windows runners; its command steps explicitly use Bash so environment-variable handling is consistent. Copy `examples/github-actions/coupling-guard.yml` to `.github/workflows/coupling-guard.yml` in your GitHub repository to activate it.
+
+## Local C/C++ + Jira workflow (`ccdc-local`)
+
+This is the interactive local workflow requested for supplying the repository and Jira links directly to the tool. It does not require a Jira connector in GitHub; it calls Jira's REST API from your machine.
+
+### Install
+
+Create and activate a virtual environment, then install this tool and its Tree-sitter C/C++ grammars:
+
+```bash
+python -m venv .venv
+# macOS/Linux
+source .venv/bin/activate
+# Windows PowerShell: .venv\Scripts\Activate.ps1
+python -m pip install -e .
+```
+
+Git must be installed. For private repositories, configure Git Credential Manager or SSH access normally before launching the tool. Do not put Git/Jira credentials in the repository or pass them in command-line arguments.
+
+### Configure Jira credentials locally
+
+For Jira Cloud, configure `JIRA_EMAIL` and `JIRA_API_TOKEN` in your local environment. For Jira Data Center, configure `JIRA_PAT` if your instance accepts bearer PAT authentication. Credentials are read from environment variables only; they are not stored in the report or sent to Git.
+
+On Windows, set these using your normal secure environment/secret-management method before opening the tool. On macOS/Linux, use your shell's secure secret manager or environment configuration. Never commit a `.env` file containing credentials.
+
+### Start the interactive run
+
+```bash
+ccdc-local
+```
+
+The tool prompts for:
+
+1. A Git repository URL or local Git working-copy path.
+2. A Jira site URL (or a direct Jira issue URL such as `/browse/SCR-123`).
+3. The SCR issue to analyze, selected from issues updated in the last 30 days in project `SCR` by default.
+
+You can set the project and update window on the command line, for example:
+
+```bash
+ccdc-local --repo "https://github.com/example/flight-software.git" --jira-url "https://example.atlassian.net" --project SCR --days 60
+```
+
+The command still displays the recent issue list and asks you to select one. To open one known issue directly:
+
+```bash
+ccdc-local --repo "https://github.com/example/flight-software.git" --jira-url "https://example.atlassian.net" --issue SCR-123
+```
+
+After selection, it looks for branches or commit messages containing the SCR key. If found, select the candidate branch/commit and the base ref. If there is no issue-key match, the tool prompts for base and head refs. **For reliable automatic mapping, use the SCR key in branch names or commit messages**, for example `feature/SCR-123-calibration` and `Fix sensor scale SCR-123`. A Jira issue list alone cannot establish which code change belongs to that issue.
+
+The tool clones the source into a temporary local directory, checks out the selected head there, compares the selected base/head, and deletes the temporary clone when analysis completes. Reports remain locally under `ccdc-reports/<SCR-KEY>/`:
+
+- `ccdc-report.md` — issue, changed files/functions, impact, CC/DC edges, requirements/tests, parse warnings, and limitations.
+- `ccdc-report.json` — structured findings, edge states, and selected refs.
+- `impact-flow.mmd` — Mermaid diagram source.
+- `source-diff.patch` — source diff for the selected Git range.
+
+Open the Markdown report in an editor and `impact-flow.mmd` in a Mermaid-compatible viewer. No source is uploaded to Jira by this tool; Jira is queried for issue metadata. Git itself contacts the supplied repository host to clone/fetch as expected.
+
+### Windows example
+
+In PowerShell, after installing the package and setting Jira credentials in the environment:
+
+```powershell
+ccdc-local --repo "https://github.com/example/flight-software.git" --jira-url "https://example.atlassian.net" --project SCR --days 30 --out "C:\work\ccdc-reports"
+```
+
+The same command works with a local repository path, such as `--repo "C:\work\flight-software"`. Reports are written to the `--out` directory. The CLI itself prompts for the Jira issue and refs when necessary.
+
+### Configure component and traceability mappings
+
+Optionally put `ccdc.json` at the target repository root, or pass a config path using `--config`. Component path prefixes define the software boundaries used in inter-component reporting. Requirements map to function IDs, and tests map to requirement IDs:
+
+```json
+{
+  "components": {
+    "Sensor": ["src/sensor"],
+    "Control": ["src/control"],
+    "Actuator": ["src/actuator"]
+  },
+  "requirements": {
+    "REQ-TEMP-014": ["src/sensor/sensor.c::convert_temperature#1"],
+    "REQ-VALVE-022": ["src/control/controller.cpp::update_valve#2"]
+  },
+  "tests": {
+    "TC-TEMP-LIMIT": ["REQ-TEMP-014", "REQ-VALVE-022"]
+  }
+}
+```
+
+Without `ccdc.json`, the analyzer uses the first directory in each source path as a provisional component and reports no requirements/tests unless mapped. Function IDs are emitted in the report; use those exact IDs in mappings.
+
+### Test the C/C++ analyzer without Jira
+
+Install the project and run the automated suite:
+
+```bash
+python -m unittest discover -v
+```
+
+The C/C++ test creates a temporary Git repository, changes a C function, runs analysis against a C++ caller/controller/actuator flow, and checks that data/control edges and reports are produced. It does not require a Jira server or a real source repository.
 
 ### Demonstrate a regression being caught
 

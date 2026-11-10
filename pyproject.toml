@@ -5,12 +5,17 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "coupling-guard-prototype"
 version = "0.1.0"
-description = "Prototype static Python coupling and change-impact analyzer"
+description = "Local Python and C/C++ coupling impact analysis with Jira issue selection"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = [
+  "tree-sitter>=0.25,<0.26",
+  "tree-sitter-c>=0.24,<0.25",
+  "tree-sitter-cpp>=0.23,<0.24",
+]
 
 [project.scripts]
 coupling-guard = "coupling_guard.cli:main"
+ccdc-local = "ccdc_local.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["coupling_guard*"]
+include = ["coupling_guard*", "ccdc_local*"]

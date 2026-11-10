@@ -1,0 +1,79 @@
+import json
+import shutil
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+from ccdc_local.analyzer import analyze_change
+
+
+class CxxAnalyzerTests(unittest.TestCase):
+    def test_c_and_cpp_change_produces_data_control_and_flow_report(self):
+        if not shutil.which("git"):
+            self.skipTest("git is required for the local repository integration test")
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / "repo"
+            (root / "src" / "sensor").mkdir(parents=True)
+            (root / "src" / "control").mkdir(parents=True)
+            (root / "src" / "output").mkdir(parents=True)
+            (root / "src" / "app").mkdir(parents=True)
+            (root / "src" / "sensor" / "sensor.h").write_text("float convert_temperature(int raw);\n")
+            (root / "src" / "sensor" / "sensor.c").write_text(
+                "float convert_temperature(int raw) { return raw * 0.1f; }\n"
+            )
+            (root / "src" / "output" / "actuator.h").write_text(
+                "void actuator_open();\nvoid actuator_close();\n"
+            )
+            (root / "src" / "output" / "actuator.cpp").write_text(
+                '#include "actuator.h"\nvoid actuator_open() {}\nvoid actuator_close() {}\n'
+            )
+            (root / "src" / "control" / "controller.h").write_text(
+                "void update_valve(float temperature, float limit);\n"
+            )
+            (root / "src" / "control" / "controller.cpp").write_text(
+                '#include "controller.h"\n#include "../output/actuator.h"\n'
+                "void update_valve(float temperature, float limit) {\n"
+                "  if (temperature >= limit) actuator_open(); else actuator_close();\n"
+                "}\n"
+            )
+            (root / "src" / "app" / "app.cpp").write_text(
+                '#include "../sensor/sensor.h"\n#include "../control/controller.h"\n'
+                "void process(int raw) { update_valve(convert_temperature(raw), 20.0f); }\n"
+            )
+            config = {
+                "components": {
+                    "Sensor": ["src/sensor"],
+                    "Control": ["src/control"],
+                    "Output": ["src/output"],
+                    "Application": ["src/app"],
+                },
+                "requirements": {"REQ-TEMP": ["src/sensor/sensor.c::convert_temperature#1"]},
+                "tests": {"TC-TEMP": ["REQ-TEMP"]},
+            }
+            (root / "ccdc.json").write_text(json.dumps(config))
+            subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.email", "test@example.invalid"], cwd=root, check=True)
+            subprocess.run(["git", "config", "user.name", "CCDC Test"], cwd=root, check=True)
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "SCR-12 baseline"], cwd=root, check=True)
+            base = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+            sensor = root / "src" / "sensor" / "sensor.c"
+            sensor.write_text("float convert_temperature(int raw) { return raw * 0.01f; }\n")
+            subprocess.run(["git", "add", "."], cwd=root, check=True)
+            subprocess.run(["git", "commit", "-qm", "SCR-12 change calibration"], cwd=root, check=True)
+            head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True).strip()
+            output = Path(temp) / "report"
+            issue = {"key": "SCR-12", "summary": "Change calibration", "updated": "today", "status": "Open"}
+            files = analyze_change(root, base, head, issue, output, root / "ccdc.json")
+            report = json.loads(files["json"].read_text())
+            self.assertIn("src/sensor/sensor.c::convert_temperature#1", report["changed_functions"])
+            self.assertIn("TC-TEMP", report["recommended_tests"])
+            self.assertTrue(any(edge["cross_component"] and "data" in edge["coupling_types"] for edge in report["edges"]))
+            self.assertTrue(any("control" in edge["coupling_types"] for edge in report["edges"]))
+            self.assertTrue(files["mermaid"].exists())
+            self.assertTrue(files["diff"].exists())
+
+
+if __name__ == "__main__":
+    unittest.main()

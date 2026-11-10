@@ -26,6 +26,10 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Install analyzer and language parsers
+        shell: bash
+        run: python -m pip install -e .
+
       - name: Analyze changed code
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}

@@ -497,26 +497,31 @@ def report_markdown(report: dict[str, Any]) -> str:
 
 def report_mermaid(report: dict[str, Any]) -> str:
     edges = report["edges"]
-    nodes = set()
-    lines = ["flowchart LR"]
+    changed = set(report["changed_functions"])
+    impacted = set(report["impacted_functions"])
+    nodes = set(changed) | set(impacted)
     for edge in edges:
         nodes.add(edge["caller"])
         nodes.add(edge["callee"])
+    ids = {node: f"N{index}" for index, node in enumerate(sorted(nodes))}
+    lines = ["flowchart LR"]
+    for node, node_id in ids.items():
+        label = node.replace('"', "'")
+        lines.append(f'  {node_id}["{label}"]')
+    for edge in edges:
         label = ", ".join(edge["coupling_types"]) or "call"
         if edge["change_state"] in {"added", "removed"}:
             label += f", {edge['change_state']}"
         if edge["control_context"] and "control" not in edge["coupling_types"]:
             label += ", control context"
-        lines.append(f'  "{edge["caller"]}" -->|"{label}"| "{edge["callee"]}"')
-    changed = set(report["changed_functions"])
-    impacted = set(report["impacted_functions"])
-    for node in sorted(nodes):
+        lines.append(f'  {ids[edge["caller"]]} -->|"{label}"| {ids[edge["callee"]]}')
+    for node, node_id in ids.items():
         if node in changed:
-            lines.append(f'  style "{node}" fill:#ffd6d6,stroke:#c00,stroke-width:3px')
+            lines.append(f"  style {node_id} fill:#ffd6d6,stroke:#c00,stroke-width:3px")
         elif node in impacted:
-            lines.append(f'  style "{node}" fill:#fff0c2,stroke:#a66b00,stroke-width:2px')
-    if len(lines) == 1:
-        lines.append('  "No resolvable flows"')
+            lines.append(f"  style {node_id} fill:#fff0c2,stroke:#a66b00,stroke-width:2px")
+    if not ids:
+        lines.append('  Empty["No resolvable flows"]')
     return "\n".join(lines) + "\n"
 
 
