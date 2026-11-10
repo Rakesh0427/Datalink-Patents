@@ -72,7 +72,16 @@ class CxxAnalyzerTests(unittest.TestCase):
             self.assertTrue(any(edge["cross_component"] and "data" in edge["coupling_types"] for edge in report["edges"]))
             self.assertTrue(any("control" in edge["coupling_types"] for edge in report["edges"]))
             self.assertTrue(files["mermaid"].exists())
+            self.assertTrue(files["mermaid_svg"].exists())
+            self.assertTrue(files["mermaid_png"].exists())
+            self.assertIn("<svg", files["mermaid_svg"].read_text())
+            self.assertTrue(files["mermaid_png"].read_bytes().startswith(b"\x89PNG\r\n\x1a\n"))
             self.assertTrue(files["diff"].exists())
+            markdown = files["markdown"].read_text()
+            self.assertIn("## At a glance", markdown)
+            self.assertIn("CC edges — Control Coupling", markdown)
+            self.assertIn("DC edges — Data Coupling", markdown)
+            self.assertIn("Mermaid.js", markdown)
 
 
 if __name__ == "__main__":
